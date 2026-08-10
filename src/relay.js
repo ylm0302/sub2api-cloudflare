@@ -436,6 +436,15 @@ function openAIToolsToGemini(tools) {
 function openAIToAntigravity(body, model, projectId) {
   const { system, rest } = splitSystem(body.messages || []);
   const contents = [];
+  // tool_call_id -> 函数名 映射（来自 assistant tool_calls，供 tool 消息的 functionResponse.name 复用）
+  const toolIdToName = {};
+  for (const m of rest) {
+    if (m.role === "assistant" && Array.isArray(m.tool_calls)) {
+      for (const tc of m.tool_calls) {
+        if (tc && tc.id && tc.function && tc.function.name) toolIdToName[tc.id] = tc.function.name;
+      }
+    }
+  }
   for (const m of rest) {
     const role = m.role === "assistant" ? "model" : m.role === "tool" ? "user" : "user";
     const parts = [];
@@ -450,9 +459,15 @@ function openAIToAntigravity(body, model, projectId) {
     }
     // user tool 消息 -> functionResponse 部分（结果文本内嵌在 response 里，不额外发 text part）
     if (m.role === "tool" && m.tool_call_id) {
-      const name = m.name || "tool";
+      const name = toolIdToName[m.tool_call_id] || m.name || "tool";
+      // Gemini 要求 function_response.response 是 Struct（对象）；标量/数组需包一层 output
       let resp;
-      try { resp = JSON.parse(m.content); } catch { resp = { output: String(m.content == null ? "" : m.content) }; }
+      try {
+        const parsed = JSON.parse(m.content);
+        resp = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : { output: String(m.content == null ? "" : m.content) };
+      } catch {
+        resp = { output: String(m.content == null ? "" : m.content) };
+      }
       parts.push({ functionResponse: { name, response: resp } });
     } else {
       const text = msgText(m.content);
