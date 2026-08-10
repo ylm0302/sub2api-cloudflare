@@ -101,7 +101,7 @@ function parseSSE(text) {
 function setup() {
   const db = makeD1();
   db.migrate();
-  const env = { DB: db, ADMIN_TOKEN: "test-admin-token" };
+  const env = { DB: db, ADMIN_EMAIL: "admin@test.com", ADMIN_PASSWORD: "test-pass" };
   const ctx = makeCtx();
   __resetRuntimeState(); // 清空跨测试残留的进程内限流/并发计数
   return { db, env, ctx };
@@ -403,7 +403,7 @@ async function integrationTests(mock) {
     eq(r.status, 200, "status 200");
     const t = await r.text();
     assert(t.includes("管理后台"), "含后台标题");
-    assert(t.includes('id="token"'), "含令牌输入框");
+    assert(t.includes('id="login_email"'), "含登录表单");
   });
 
   await test("无 key 调用 /v1/chat/completions -> 401", async () => {
@@ -425,7 +425,7 @@ async function integrationTests(mock) {
     const noTok = await worker.fetch(new Request("https://x/admin/stats"), env, ctx);
     eq(noTok.status, 401, "无 token 401");
     const withTok = await worker.fetch(
-      new Request("https://x/admin/stats", { headers: { "x-admin-token": "test-admin-token" } }),
+      new Request("https://x/admin/stats", { headers: { authorization: "Basic " + btoa("admin@test.com:test-pass") } }),
       env,
       ctx
     );
@@ -436,7 +436,7 @@ async function integrationTests(mock) {
 
   await test("管理 API 建账号/建 key (真实 D1 写)", async () => {
     const { env, ctx } = setup();
-    const H = { "x-admin-token": "test-admin-token", "content-type": "application/json" };
+    const H = { authorization: "Basic " + btoa("admin@test.com:test-pass"), "content-type": "application/json" };
     const a = await worker.fetch(
       new Request("https://x/admin/accounts", { method: "POST", headers: H, body: JSON.stringify({ name: "acc", platform: "openai", type: "api_key", credentials: { api_key: "sk-x" } }) }),
       env,
@@ -714,7 +714,7 @@ async function integrationTests(mock) {
 
   await test("双格式导入：简化数组批量建账号", async () => {
     const { db, env, ctx } = setup();
-    const H = { "x-admin-token": "test-admin-token", "content-type": "application/json" };
+    const H = { authorization: "Basic " + btoa("admin@test.com:test-pass"), "content-type": "application/json" };
     const r = await worker.fetch(
       new Request("https://x/admin/accounts/import", {
         method: "POST", headers: H,
@@ -735,7 +735,7 @@ async function integrationTests(mock) {
 
   await test("导入去重：同名同平台重复导入 -> skipped/updated", async () => {
     const { db, env, ctx } = setup();
-    const H = { "x-admin-token": "test-admin-token", "content-type": "application/json" };
+    const H = { authorization: "Basic " + btoa("admin@test.com:test-pass"), "content-type": "application/json" };
     const one = { name: "dup", platform: "openai", type: "api_key", credentials: { api_key: "sk-dup" } };
     await worker.fetch(new Request("https://x/admin/accounts/import", { method: "POST", headers: H, body: JSON.stringify([one]) }), env, ctx);
     const r2 = await worker.fetch(new Request("https://x/admin/accounts/import", { method: "POST", headers: H, body: JSON.stringify([one]) }), env, ctx);
@@ -745,7 +745,7 @@ async function integrationTests(mock) {
 
   await test("cookie/sessionKey 类型导入被拒绝", async () => {
     const { db, env, ctx } = setup();
-    const H = { "x-admin-token": "test-admin-token", "content-type": "application/json" };
+    const H = { authorization: "Basic " + btoa("admin@test.com:test-pass"), "content-type": "application/json" };
     const r = await worker.fetch(
       new Request("https://x/admin/accounts/import", {
         method: "POST", headers: H,
@@ -871,32 +871,32 @@ async function integrationTests(mock) {
     const { db, env, ctx } = setup();
     // 正常环境：令牌已配置、D1 已建表
     const d = await worker.fetch(new Request("https://x/admin/diag"), env, ctx).then((r) => r.json());
-    eq(d.admin_token_configured, true, "令牌已配置");
+    eq(d.admin_configured, true, "管理员已配置");
     eq(d.d1_ok, true, "D1 建表正常");
     eq(d.d1_tables.accounts_v2, true, "accounts_v2 表存在");
     // 令牌没配：diag 明确指出 + admin API 返回明确提示
-    const envNoTok = { DB: db }; // 无 ADMIN_TOKEN
+    const envNoTok = { DB: db }; // 无管理员账号配置
     const d2 = await worker.fetch(new Request("https://x/admin/diag"), envNoTok, ctx).then((r) => r.json());
-    eq(d2.admin_token_configured, false, "diag 显示未配置");
-    const r = await worker.fetch(new Request("https://x/admin/stats", { headers: { "x-admin-token": "anything" } }), envNoTok, ctx);
+    eq(d2.admin_configured, false, "diag 显示未配置");
+    const r = await worker.fetch(new Request("https://x/admin/stats", { headers: { authorization: "Basic " + btoa("anything:wrong") } }), envNoTok, ctx);
     eq(r.status, 401, "未配置时 401");
     const j = await r.json();
-    assert(/ADMIN_TOKEN 未配置/.test(j.error), "提示未配置");
-    // 有配置但令牌错 / 缺失：对应提示
-    const r2 = await worker.fetch(new Request("https://x/admin/stats", { headers: { "x-admin-token": "wrong" } }), env, ctx);
+    assert(/管理员账号未配置/.test(j.error), "提示未配置");
+    // 有配置但凭证错 / 缺失：对应提示
+    const r2 = await worker.fetch(new Request("https://x/admin/stats", { headers: { authorization: "Basic " + btoa("wrong@x.com:wrong") } }), env, ctx);
     const j2 = await r2.json();
-    assert(/令牌不正确/.test(j2.error), "提示令牌不正确");
+    assert(/unauthorized/.test(j2.error), "提示未授权");
     const r3 = await worker.fetch(new Request("https://x/admin/stats"), env, ctx);
     const j3 = await r3.json();
-    assert(/缺少管理令牌/.test(j3.error), "提示缺少令牌");
+    assert(/请先登录/.test(j3.error), "提示请先登录");
     // 正确令牌正常
-    const ok = await worker.fetch(new Request("https://x/admin/stats", { headers: { "x-admin-token": "test-admin-token" } }), env, ctx);
+    const ok = await worker.fetch(new Request("https://x/admin/stats", { headers: { authorization: "Basic " + btoa("admin@test.com:test-pass") } }), env, ctx);
     eq(ok.status, 200, "正确令牌 200");
   });
 
   await test("真实 Sub2API 备份导出格式 {accounts:[...],expires_at秒} 可导入", async () => {
     const { db, env, ctx } = setup();
-    const H = { "x-admin-token": "test-admin-token", "content-type": "application/json" };
+    const H = { authorization: "Basic " + btoa("admin@test.com:test-pass"), "content-type": "application/json" };
     // 复刻 Sub2API ExportData 真实结构（外层 accounts、unix 秒 expires_at）
     const exportPayload = {
       version: 1,
@@ -1295,7 +1295,7 @@ async function integrationTests(mock) {
 
   await test("POST /admin/accounts/data（sub2api-data 格式，proxies 跳过 + apikey 别名）", async () => {
     const { db, env, ctx } = setup();
-    const H = { "x-admin-token": "test-admin-token", "content-type": "application/json" };
+    const H = { authorization: "Basic " + btoa("admin@test.com:test-pass"), "content-type": "application/json" };
     const payload = {
       data: {
         type: "sub2api-data", version: 1, exported_at: "2026-07-18T08:14:00Z",
@@ -1326,7 +1326,7 @@ async function integrationTests(mock) {
   await test("GET /admin/accounts/data 导出 sub2api-data 格式", async () => {
     const { db, env, ctx } = setup();
     await seedAccount(db, { provider: "openai", name: "oa", api_key: "sk-export" });
-    const H = { "x-admin-token": "test-admin-token" };
+    const H = { authorization: "Basic " + btoa("admin@test.com:test-pass") };
     const r = await worker.fetch(new Request("https://x/admin/accounts/data", { headers: H }), env, ctx);
     eq(r.status, 200, "status 200");
     const j = await r.json();
@@ -1338,7 +1338,7 @@ async function integrationTests(mock) {
 
   await test("完整备份导出/导入：用户/Key/分组/套餐/订阅/兑换码/公告/设置/限流全量回导", async () => {
     const { db, env, ctx } = setup();
-    const H = { "x-admin-token": "test-admin-token", "content-type": "application/json" };
+    const H = { authorization: "Basic " + btoa("admin@test.com:test-pass"), "content-type": "application/json" };
     // 造一套完整数据
     await worker.fetch(new Request("https://x/admin/users", { method: "POST", headers: H, body: JSON.stringify({ username: "alice", email: "a@x.com", balance_tokens: 5000 }) }), env, ctx);
     await worker.fetch(new Request("https://x/admin/groups", { method: "POST", headers: H, body: JSON.stringify({ name: "VIP", platform: "openai" }) }), env, ctx);
@@ -1371,7 +1371,7 @@ async function integrationTests(mock) {
 
     // 全新实例回导（跨实例迁移）
     const db2 = makeD1(); db2.migrate();
-    const env2 = { DB: db2, ADMIN_TOKEN: "test-admin-token" };
+    const env2 = { DB: db2, ADMIN_EMAIL: "admin@test.com", ADMIN_PASSWORD: "test-pass" };
     const ctx2 = makeCtx();
     const r2 = await worker.fetch(new Request("https://x/admin/accounts/data", { method: "POST", headers: H, body: JSON.stringify({ data: j }) }), env2, ctx2);
     eq(r2.status, 200, "回导 200");
@@ -1414,7 +1414,7 @@ async function integrationTests(mock) {
 
   await test("POST /admin/accounts/import 支持 NDJSON（每行一个账号对象）", async () => {
     const { db, env, ctx } = setup();
-    const H = { "x-admin-token": "test-admin-token", "content-type": "application/json" };
+    const H = { authorization: "Basic " + btoa("admin@test.com:test-pass"), "content-type": "application/json" };
     const ndjson = JSON.stringify({ id: 1, name: "acc-a", platform: "openai", type: "oauth", credentials: { access_token: "sk-a", refresh_token: "rt-a", expires_at: 1700000000 } })
       + "\n"
       + JSON.stringify({ id: 2, name: "acc-b", platform: "gemini", type: "oauth", credentials: { access_token: "sk-b", refresh_token: "rt-b" } })
@@ -1435,7 +1435,7 @@ async function integrationTests(mock) {
 
   await test("POST /admin/accounts/import 修复 \\\" 双重转义损坏行（原版 Go 导出）", async () => {
     const { db, env, ctx } = setup();
-    const H = { "x-admin-token": "test-admin-token", "content-type": "application/json" };
+    const H = { authorization: "Basic " + btoa("admin@test.com:test-pass"), "content-type": "application/json" };
     // 原版导出的 temp_unschedulable_reason 里出现 \\"，导致整行不是合法 JSON
     const badLine = JSON.stringify({ id: 26, name: "B #2", platform: "grok", type: "oauth", credentials: { access_token: "sk-grok", refresh_token: "rt-grok" } })
       .replace("}", ",\"temp_unschedulable_reason\":\"token refresh retry exhausted: code=*** reason=\\\\\"GROK_OAUTH_REQUEST_FAILED\\\\\"\"}");
@@ -1457,7 +1457,7 @@ async function integrationTests(mock) {
 
   await test("POST /admin/accounts/import 支持 ISO 日期字符串 expires_at（原版 grok 导出）", async () => {
     const { db, env, ctx } = setup();
-    const H = { "x-admin-token": "test-admin-token", "content-type": "application/json" };
+    const H = { authorization: "Basic " + btoa("admin@test.com:test-pass"), "content-type": "application/json" };
     const payload = [{
       id: 26, name: "B #2", platform: "grok", type: "oauth",
       credentials: { access_token: "sk-grok", refresh_token: "rt-grok", expires_at: "2026-08-01T20:46:05Z" },
@@ -1476,7 +1476,7 @@ async function integrationTests(mock) {
 
   await test("POST /admin/accounts/import 同名不同 token 账号各自独立（原版允许重名）", async () => {
     const { db, env, ctx } = setup();
-    const H = { "x-admin-token": "test-admin-token", "content-type": "application/json" };
+    const H = { authorization: "Basic " + btoa("admin@test.com:test-pass"), "content-type": "application/json" };
     const two = [
       { id: 70, name: "B", platform: "antigravity", type: "oauth", credentials: { email: "a@x.com", access_token: "ya29.aaa", refresh_token: "1//aaa" } },
       { id: 74, name: "B", platform: "antigravity", type: "oauth", credentials: { email: "b@x.com", access_token: "ya29.bbb", refresh_token: "1//bbb" } },
@@ -1495,7 +1495,7 @@ async function integrationTests(mock) {
 
   await test("POST /admin/accounts/import 支持 antigravity 平台（OAuth）", async () => {
     const { db, env, ctx } = setup();
-    const H = { "x-admin-token": "test-admin-token", "content-type": "application/json" };
+    const H = { authorization: "Basic " + btoa("admin@test.com:test-pass"), "content-type": "application/json" };
     const payload = [{
       id: 70, name: "B", platform: "antigravity", type: "oauth", concurrency: 10,
       credentials: { email: "test@example.com", access_token: "ya29.abc", refresh_token: "1//xyz", expires_at: 1786343035 },
@@ -1515,7 +1515,7 @@ async function integrationTests(mock) {
 
   await test("POST /admin/accounts/import/codex-session 子路径（与原版前端一致）", async () => {
     const { db, env, ctx } = setup();
-    const H = { "x-admin-token": "test-admin-token", "content-type": "application/json" };
+    const H = { authorization: "Basic " + btoa("admin@test.com:test-pass"), "content-type": "application/json" };
     const r = await worker.fetch(
       new Request("https://x/admin/accounts/import/codex-session", {
         method: "POST", headers: H,
@@ -1534,7 +1534,7 @@ async function integrationTests(mock) {
 
   await test("GET /admin/health 概览健康度（平台/探测/配额）", async () => {
     const { db, env, ctx } = setup();
-    const H = { "x-admin-token": "test-admin-token", "content-type": "application/json" };
+    const H = { authorization: "Basic " + btoa("admin@test.com:test-pass"), "content-type": "application/json" };
     await seedAccount(db, { name: "oa1", platform: "openai", api_key: "sk-1" });
     await seedAccount(db, { name: "oa2", platform: "openai", api_key: "sk-2" });
     await seedAccount(db, { name: "an1", platform: "anthropic", api_key: "sk-3" });
@@ -1577,7 +1577,7 @@ async function integrationTests(mock) {
     const { db, env, ctx } = setup();
     await seedAccount(db, { provider: "openai", name: "edit-me", api_key: "sk-x" });
     const row = await db.prepare("SELECT id FROM accounts_v2 WHERE name=?").bind("edit-me").first();
-    const H = { "x-admin-token": "test-admin-token", "content-type": "application/json" };
+    const H = { authorization: "Basic " + btoa("admin@test.com:test-pass"), "content-type": "application/json" };
     const r = await worker.fetch(
       new Request("https://x/admin/accounts/" + row.id, { method: "PATCH", headers: H, body: JSON.stringify({ priority: 5, schedulable: false }) }),
       env, ctx
@@ -1592,7 +1592,7 @@ async function integrationTests(mock) {
     const { db, env, ctx } = setup();
     await seedAccount(db, { provider: "openai", name: "tog", api_key: "sk-x" });
     const row = await db.prepare("SELECT id FROM accounts_v2 WHERE name=?").bind("tog").first();
-    const H = { "x-admin-token": "test-admin-token" };
+    const H = { authorization: "Basic " + btoa("admin@test.com:test-pass") };
     const r1 = await worker.fetch(new Request("https://x/admin/accounts/" + row.id + "/toggle-schedulable", { method: "POST", headers: H }), env, ctx);
     const j1 = await r1.json();
     eq(j1.schedulable, false, "切到暂停调度");
@@ -1606,7 +1606,7 @@ async function integrationTests(mock) {
     await seedAccountV2(db, { name: "err-acc", platform: "openai", credentials: { api_key: "sk-x" }, status: "error" });
     await db.prepare("UPDATE accounts_v2 SET error_message='boom' WHERE name='err-acc'").run();
     const row = await db.prepare("SELECT id FROM accounts_v2 WHERE name=?").bind("err-acc").first();
-    const H = { "x-admin-token": "test-admin-token" };
+    const H = { authorization: "Basic " + btoa("admin@test.com:test-pass") };
     const r = await worker.fetch(new Request("https://x/admin/accounts/" + row.id + "/clear-error", { method: "POST", headers: H }), env, ctx);
     eq(r.status, 200, "status 200");
     const after = await db.prepare("SELECT status, error_message FROM accounts_v2 WHERE id=?").bind(row.id).first();
@@ -1618,7 +1618,7 @@ async function integrationTests(mock) {
     const { db, env, ctx } = setup();
     const key = await seedKey(db);
     const row = await db.prepare("SELECT id FROM user_keys WHERE key=?").bind(key).first();
-    const H = { "x-admin-token": "test-admin-token", "content-type": "application/json" };
+    const H = { authorization: "Basic " + btoa("admin@test.com:test-pass"), "content-type": "application/json" };
     const t = await worker.fetch(new Request("https://x/admin/keys/toggle/" + row.id, { method: "POST", headers: H }), env, ctx);
     const tj = await t.json();
     eq(tj.enabled, false, "Key 已停用");
@@ -1643,7 +1643,7 @@ async function integrationTests(mock) {
       }), env, ctx
     );
     await ctx.drain();
-    const r = await worker.fetch(new Request("https://x/admin/usage", { headers: { "x-admin-token": "test-admin-token" } }), env, ctx);
+    const r = await worker.fetch(new Request("https://x/admin/usage", { headers: { authorization: "Basic " + btoa("admin@test.com:test-pass") } }), env, ctx);
     eq(r.status, 200, "status 200");
     const rows = await r.json();
     eq(rows.length, 1, "1 条流水");
@@ -1658,7 +1658,7 @@ async function integrationTests(mock) {
 // ============================================================
 async function parityTests(mock) {
   console.log("\n\x1b[1m[Parity] 管理模型对齐\x1b[0m");
-  const H = { "x-admin-token": "test-admin-token", "content-type": "application/json" };
+  const H = { authorization: "Basic " + btoa("admin@test.com:test-pass"), "content-type": "application/json" };
   const call = (path, opts) => worker.fetch(new Request("https://x" + path, opts || {}), ...Object.values({}));
   const adm = (path, method, body) =>
     worker.fetch(new Request("https://x" + path, { method: method || "GET", headers: H, body: body ? JSON.stringify(body) : undefined }), ...Object.values({}));
@@ -1935,7 +1935,7 @@ async function parityTests(mock) {
   await test("模型限流：用户级 / Key 级 RPM + 并发 + 优先级", async () => {
     const { db, env, ctx } = setup();
     await seedAccount(db, { name: "oa", platform: "openai", api_key: "sk-oa" });
-    const H2 = { "x-admin-token": "test-admin-token", "content-type": "application/json" };
+    const H2 = { authorization: "Basic " + btoa("admin@test.com:test-pass"), "content-type": "application/json" };
     await worker.fetch(new Request("https://x/admin/users", { method: "POST", headers: H2, body: JSON.stringify({ username: "u1", balance_tokens: -1 }) }), env, ctx);
     const mkKey = async () => {
       const key = "sk-" + crypto.randomUUID().replace(/-/g, "");

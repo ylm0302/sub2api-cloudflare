@@ -17,11 +17,11 @@ export default {
     if (path === "/health") {
       return json({ ok: true, service: "sub2api-cf", v: 2, ts: Date.now() });
     }
-    // 免令牌诊断：查看 ADMIN_TOKEN 是否配置、D1 是否绑定且建表成功
+    // 免鉴权诊断：查看管理员账号是否配置、D1 是否绑定且建表成功
     if (path === "/admin/diag" && request.method === "GET") {
       const out = {
         service: "sub2api-cf",
-        admin_token_configured: !!env.ADMIN_TOKEN,
+        admin_configured: !!(env.ADMIN_EMAIL && env.ADMIN_PASSWORD),
         d1_bound: !!env.DB,
         ts: Date.now(),
       };
@@ -876,14 +876,37 @@ const OAUTH_PROVIDERS = {
 // ---------- 管理 API ----------
 
 async function handleAdmin(request, env, url) {
-  const token = request.headers.get("x-admin-token") || url.searchParams.get("token");
-  if (!env.ADMIN_TOKEN) {
-    return json({ error: "ADMIN_TOKEN 未配置：请在 Cloudflare 上执行 wrangler secret put ADMIN_TOKEN 后重试" }, 401);
+  // 邮箱 + 密码登录（凭证通过 ADMIN_EMAIL / ADMIN_PASSWORD 环境变量设置）
+  const adminEmail = (env.ADMIN_EMAIL || "").trim();
+  const adminPassword = env.ADMIN_PASSWORD || "";
+
+  // POST /admin/login —— 登录校验（免鉴权），前端校验通过后保存凭证
+  if (request.method === "POST" && url.pathname === "/admin/login") {
+    const b = await request.json().catch(() => ({}));
+    if (b && String(b.email || "").trim() === adminEmail && String(b.password || "") === adminPassword) {
+      return json({ ok: true });
+    }
+    return json({ error: "邮箱或密码不正确" }, 401);
   }
-  if (!token) {
-    return json({ error: "缺少管理令牌：请访问 /admin?token=<ADMIN_TOKEN> 或在上方输入框粘贴" }, 401);
+
+  if (!adminEmail || !adminPassword) {
+    return json({ error: "管理员账号未配置：请在 Cloudflare 上执行 wrangler secret put ADMIN_EMAIL / ADMIN_PASSWORD 后重试" }, 401);
   }
-  if (token !== env.ADMIN_TOKEN) return json({ error: "unauthorized：管理令牌不正确" }, 401);
+  // Basic Auth 校验（Authorization: Basic base64(email:password)）
+  const auth = request.headers.get("authorization") || "";
+  let authed = false;
+  if (auth.startsWith("Basic ")) {
+    try {
+      const decoded = atob(auth.slice(6));
+      const idx = decoded.indexOf(":");
+      if (idx > 0) {
+        authed = decoded.slice(0, idx) === adminEmail && decoded.slice(idx + 1) === adminPassword;
+      }
+    } catch (e) { /* 非法 base64 */ }
+  }
+  if (!authed) {
+    return json({ error: "unauthorized：请先登录（访问 /admin 页面输入邮箱和密码）" }, 401);
+  }
 
   const db = env.DB;
   const parts = url.pathname.split("/").filter(Boolean);

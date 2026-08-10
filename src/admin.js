@@ -203,7 +203,7 @@ export const ADMIN_HTML = `<!doctype html>
     <div class="topbar">
       <h1 id="pageTitle">概览</h1>
       <div class="spacer"></div>
-      <input id="token" placeholder="ADMIN_TOKEN（粘贴后自动加载）" autocomplete="off">
+      <button class="btn" id="logoutBtn" style="display:none" onclick="logout()">退出登录</button>
     </div>
     <div class="content" id="content"></div>
   </div>
@@ -221,7 +221,12 @@ var state={view:"dashboard",accounts:[],keys:[],users:[],groups:[],modelLimits:[
 function esc(s){
   return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
 }
-function token(){return $("token").value.trim();}
+// 登录凭证（base64(email:password)），存 localStorage
+function authBasic(){
+  var raw="";
+  try{raw=localStorage.getItem("sub2api_cf_auth")||"";}catch(e){}
+  return raw;
+}
 function toast(msg,type){
   var t=document.createElement("div");
   t.className="toast "+(type||"");
@@ -286,11 +291,19 @@ function maskKey(k){return k.slice(0,8)+"…"+k.slice(-4);}
 /* ---------- API ---------- */
 function api(path,opts){
   opts=opts||{};
-  var headers=Object.assign({},opts.headers||{},{"x-admin-token":token()});
+  var headers=Object.assign({},opts.headers||{});
+  if(authBasic()) headers["authorization"]="Basic "+authBasic();
   if(opts.body) headers["content-type"]="application/json";
   return fetch(path,{method:opts.method||"GET",body:opts.body,headers:headers})
     .then(function(r){return r.json().then(function(j){
-      if(!r.ok){var e=new Error(j.error||("HTTP "+r.status));e.status=r.status;e.body=j;throw e;}
+      if(!r.ok){
+        // 未登录 / 凭证失效：清除并回到登录页（/admin/login 本身除外）
+        if(r.status===401&&path!=="/admin/login"){
+          try{localStorage.removeItem("sub2api_cf_auth");}catch(e){}
+          showLogin();
+        }
+        var e=new Error(j.error||("HTTP "+r.status));e.status=r.status;e.body=j;throw e;
+      }
       return j;
     });});
 }
@@ -417,7 +430,7 @@ function loadDashboard(){
 }
 function exportData(e){
   e.preventDefault();
-  return fetch("/admin/accounts/data",{headers:{"x-admin-token":token()}})
+  return fetch("/admin/accounts/data",{headers:{"authorization":"Basic "+authBasic()}})
     .then(function(r){return r.json();})
     .then(function(j){
       var blob=new Blob([JSON.stringify(j,null,2)],{type:"application/json"});
@@ -1690,17 +1703,47 @@ function closeModal(){
 }
 
 /* ---------- 初始化 ---------- */
+function showLogin(){
+  $("logoutBtn").style.display="none";
+  $("content").innerHTML=
+    '<div class="card" style="max-width:420px;margin:60px auto">'+
+      '<h2>🔐 管理员登录</h2>'+
+      '<div class="m-sub">输入管理员邮箱和密码（在 Worker 中通过 ADMIN_EMAIL / ADMIN_PASSWORD 环境变量设置）</div>'+
+      '<label>邮箱</label><input id="login_email" type="text" autocomplete="username" placeholder="admin@example.com">'+
+      '<label>密码</label><input id="login_password" type="password" autocomplete="current-password">'+
+      '<div style="margin-top:16px;display:flex;justify-content:flex-end"><button class="btn primary" onclick="doLogin()">登录</button></div>'+
+    '</div>';
+  try{$("login_email").focus();}catch(e){}
+}
+function doLogin(){
+  var email=$("login_email").value.trim();
+  var password=$("login_password").value;
+  if(!email||!password){toast("请填写邮箱和密码","err");return;}
+  fetch("/admin/login",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({email:email,password:password})})
+    .then(function(r){return r.json();})
+    .then(function(j){
+      if(j.ok){
+        try{localStorage.setItem("sub2api_cf_auth",btoa(email+":"+password));}catch(e){}
+        $("logoutBtn").style.display="";
+        switchView("dashboard");
+      }else{
+        toast(j.error||"邮箱或密码不正确","err");
+      }
+    })
+    .catch(function(e){toast("登录失败："+e.message,"err");});
+}
+function logout(){
+  try{localStorage.removeItem("sub2api_cf_auth");}catch(e){}
+  showLogin();
+}
 function init(){
   bindNav();
-  var t="";
-  try{t=new URLSearchParams(location.search).get("token")||localStorage.getItem("sub2api_cf_token")||"";}catch(e){}
-  $("token").value=t;
-  $("token").addEventListener("input",function(){
-    try{localStorage.setItem("sub2api_cf_token",this.value.trim());}catch(e){}
-    if(this.value.trim())switchView(state.view);else $("content").innerHTML='<div class="card"><span class="sub">请先在上方输入 ADMIN_TOKEN</span></div>';
-  });
-  if(t)switchView("dashboard");
-  else $("content").innerHTML='<div class="card"><span class="sub">请先在上方输入 ADMIN_TOKEN 以加载后台数据。</span><br><span class="sub">提示：也可以直接访问 /admin?token=&lt;ADMIN_TOKEN&gt; 自动填入。</span></div>';
+  if(authBasic()){
+    $("logoutBtn").style.display="";
+    switchView("dashboard");
+  }else{
+    showLogin();
+  }
 }
 document.addEventListener("DOMContentLoaded",init);
 </script>

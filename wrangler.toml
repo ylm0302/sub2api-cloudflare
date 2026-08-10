@@ -17,6 +17,7 @@ database_id = "852335e8-9613-44ac-ba34-de9c22e554d5"
 crons = ["*/10 * * * *"]
 
 # 密钥（不要用明文写在文件里，用 `wrangler secret put` 设置）：
-#   ADMIN_TOKEN  —— 管理后台 / 管理 API 的访问令牌
+#   ADMIN_EMAIL     —— 管理员登录邮箱（管理后台邮箱+密码登录）
+#   ADMIN_PASSWORD  —— 管理员登录密码
 #   GEMINI_OAUTH_CLIENT_SECRET —— 可选，Gemini OAuth 刷新需要
 # 设置命令见 README.md
