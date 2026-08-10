@@ -1,6 +1,6 @@
 // index.js — Sub2API-CF 网关入口（Cloudflare Workers + D1，v2）
 import {
-  buildUpstream, makeOpenAIStream, makeOpenAIStreamRetryable, openaiPassTranslator,
+  buildUpstream, makeOpenAIStream, openaiPassTranslator,
   DEFAULT_BASE, DEFAULT_MODELS, OAUTH_TOKEN_URL, needsOAuthRefresh, refreshOAuth,
   anthropicReqToOpenAI, geminiReqToOpenAI, responsesReqToOpenAI,
   openAIRespToAnthropic, openAIRespToGemini, openAIRespToResponses,
@@ -277,10 +277,10 @@ async function handleChat(request, env, ctx, protocol = "openai", geminiMeta = n
       }
     }
     attempted++;
-    const retryable = tried.size < candidates.length;
-    const result = await relayToUpstream(upstream, acct, openaiBody, keyRow, env, ctx, protocol, retryable, request.signal);
-    if (result && result.__emptyRetry) {
-      // 空响应/上游错误：软隔离该账号 60s，避免后续请求继续命中，再试下一个候选
+    const allowSwitch = tried.size < candidates.length;
+    const result = await relayToUpstream(upstream, acct, openaiBody, keyRow, env, ctx, protocol, allowSwitch, request.signal);
+    if (result && result.__switchAccount) {
+      // 上游错误（429/401/403/5xx）：软隔离该账号 60s，避免后续请求继续命中，再试下一个候选
       await db
         .prepare("UPDATE accounts_v2 SET temp_unschedulable_until = ? WHERE id = ?")
         .bind(now() + 60 * 1000, acct.id)
@@ -290,7 +290,7 @@ async function handleChat(request, env, ctx, protocol = "openai", geminiMeta = n
     return result;
   }
   if (!attempted && busy) return json({ error: "account busy, retry later" }, 429);
-  return json({ error: "all upstream accounts failed or returned empty responses", retry: true }, 502);
+  return json({ error: "all upstream accounts failed", retry: true }, 502);
 }
 
 // 同协议直通转发：请求体原样发给上游（只替换鉴权头），响应透传，同时捕获用量落库。
@@ -493,7 +493,7 @@ export function __resetRuntimeState() {
 
 // clientProtocol：客户端期望的响应协议（"openai" | "anthropic" | "gemini"）。
 // 上游响应统一转成 OpenAI 格式后，再转回客户端协议。
-async function relayToUpstream(upstream, acct, body, keyRow, env, ctx, clientProtocol = "openai", retryEmpty = false, signal = null) {
+async function relayToUpstream(upstream, acct, body, keyRow, env, ctx, clientProtocol = "openai", allowSwitch = false, signal = null) {
   const model = (safeJson(acct.model_map, {})[body.model]) || body.model;
   let upstreamResp;
   try {
@@ -534,15 +534,9 @@ async function relayToUpstream(upstream, acct, body, keyRow, env, ctx, clientPro
         openai = null;
       }
     }
-    // 空响应 / 上游错误状态 → 通知调用方切换下一个候选账号
-    if (retryEmpty) {
-      const choice = (openai && openai.choices && openai.choices[0]) || {};
-      const msg = choice.message || {};
-      const hasText = typeof msg.content === "string" && msg.content.length > 0;
-      const hasTools = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
-      const isEmptyOk = !!openai && !hasText && !hasTools && Array.isArray(openai.choices) && openai.choices.length > 0;
-      if (upstreamResp.status !== 200 || isEmptyOk) return { __emptyRetry: true };
-    }
+    // 只有账号“不可用”（非 200 错误状态）才切换下一个候选账号；
+    // 200 空内容直接透传（避免重试导致 codex 客户端看到流被中断、Claude Code 收到重复内容）
+    if (allowSwitch && upstreamResp.status !== 200) return { __switchAccount: true };
     const usage = openai && openai.usage;
     if (usage) ctx.waitUntil(logUsage(env, keyRow, acct, model, usage));
     let out = text;
@@ -561,7 +555,7 @@ async function relayToUpstream(upstream, acct, body, keyRow, env, ctx, clientPro
   if (upstreamResp.status !== 200) {
     const errText = await upstreamResp.text();
     // 还有候选账号时：429/401/403/5xx 等错误状态也切换下一个账号
-    if (retryEmpty) return { __emptyRetry: true };
+    if (allowSwitch) return { __switchAccount: true };
     return new Response(errText, {
       status: upstreamResp.status,
       headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
@@ -572,24 +566,8 @@ async function relayToUpstream(upstream, acct, body, keyRow, env, ctx, clientPro
   const onDone = async (st) => {
     if (st.usage) await logUsage(env, keyRow, acct, model, st.usage);
   };
-  if (retryEmpty) {
-    // 空响应自动重试：缓冲到首个内容 chunk 或 EOF 判断空/非空，空则换下一个账号
-    const { stream, emptiness } = makeOpenAIStreamRetryable(upstreamResp.body, translator, state, onDone, clientProtocol);
-    const empty = await Promise.race([
-      emptiness,
-      new Promise((r) => setTimeout(() => r(false), 25000)), // 首个内容 25s 未到：按非空放行，避免阻塞
-    ]);
-    if (empty) return { __emptyRetry: true };
-    return new Response(stream, {
-      status: 200,
-      headers: {
-        "content-type": "text/event-stream; charset=utf-8",
-        "cache-control": "no-store",
-        "connection": "keep-alive",
-        "x-accel-buffering": "no",
-      },
-    });
-  }
+  // 流式：直接透传转换后的 SSE。上游 200 空流也原样返回（各协议 flush 会补合法收尾，
+  // 如 Anthropic message_stop / Responses response.completed），绝不在首个 chunk 后切换账号
   const stream = makeOpenAIStream(upstreamResp.body, translator, state, onDone, clientProtocol);
   return new Response(stream, {
     status: 200,

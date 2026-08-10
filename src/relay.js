@@ -416,6 +416,129 @@ function stableSessionId(contents) {
   return uid();
 }
 
+// ---------- JSON Schema 清理（对齐原版 antigravity/schema_cleaner.go） ----------
+// Gemini v1internal 只接受 JSON Schema 白名单字段（type/description/properties/required/items/enum/title），
+// Claude Code 的 input_schema 常带 $schema / propertyNames / exclusiveMinimum / $ref / anyOf 等，
+// 直接透传会被上游 400 拒绝（Unknown name "$schema" at ...parameters）。
+const SCHEMA_ALLOWED = new Set(["type", "description", "properties", "required", "items", "enum", "title"]);
+
+function deepCopy(v) {
+  if (v === null || typeof v !== "object") return v;
+  return JSON.parse(JSON.stringify(v));
+}
+
+function hasAny(obj, keys) {
+  return keys.some((k) => k in obj);
+}
+
+// 从联合（anyOf/oneOf/items 数组）里挑“最佳”分支：优先带 properties 的 object，其次带 type 的，否则第一个
+function pickBestSchema(branches) {
+  if (!Array.isArray(branches) || !branches.length) return null;
+  let best = null;
+  for (const b of branches) {
+    if (!b || typeof b !== "object" || Array.isArray(b)) continue;
+    const score = (b.properties && Object.keys(b.properties).length ? 2 : 0) + (typeof b.type === "string" ? 1 : 0);
+    if (!best || score > best.score) best = { score, schema: b };
+  }
+  return best ? best.schema : null;
+}
+
+function mergeSchemaInto(target, src) {
+  for (const k of Object.keys(src || {})) {
+    if (k === "properties") {
+      if (!target.properties || typeof target.properties !== "object") target.properties = {};
+      for (const pk of Object.keys(src.properties)) {
+        if (!(pk in target.properties)) target.properties[pk] = deepCopy(src.properties[pk]);
+      }
+    } else if (k === "required" && Array.isArray(src.required)) {
+      const req = Array.isArray(target.required) ? target.required.slice() : [];
+      for (const r of src.required) if (!req.includes(r)) req.push(r);
+      target.required = req;
+    } else if (!(k in target)) {
+      target[k] = deepCopy(src[k]);
+    }
+  }
+}
+
+function cleanJSONSchemaRecursive(s) {
+  if (!s || typeof s !== "object" || Array.isArray(s)) return s;
+  // $ref 展开（$defs / definitions）
+  const defs = {};
+  for (const dk of ["$defs", "definitions"]) {
+    if (s[dk] && typeof s[dk] === "object" && !Array.isArray(s[dk])) {
+      Object.assign(defs, s[dk]);
+      delete s[dk];
+    }
+  }
+  const flattenRefs = (node) => {
+    if (!node || typeof node !== "object" || Array.isArray(node)) return;
+    if (typeof node.$ref === "string" && Object.keys(defs).length) {
+      const refName = node.$ref.split("/").pop();
+      delete node.$ref;
+      if (defs[refName] && typeof defs[refName] === "object" && !Array.isArray(defs[refName])) {
+        mergeSchemaInto(node, defs[refName]);
+      }
+    }
+    for (const v of Object.values(node)) flattenRefs(v);
+  };
+  flattenRefs(s);
+
+  // allOf 合并
+  if (Array.isArray(s.allOf)) {
+    for (const sub of s.allOf) if (sub && typeof sub === "object") mergeSchemaInto(s, sub);
+    delete s.allOf;
+  }
+
+  // 递归子项
+  if (s.properties && typeof s.properties === "object" && !Array.isArray(s.properties)) {
+    for (const k of Object.keys(s.properties)) s.properties[k] = cleanJSONSchemaRecursive(s.properties[k]);
+  }
+  if (Array.isArray(s.items)) {
+    // Gemini 期望 items 是单个 Schema（列表验证），元组数组取最佳分支
+    s.items = cleanJSONSchemaRecursive(pickBestSchema(s.items) || { type: "string" });
+  } else if (s.items && typeof s.items === "object") {
+    s.items = cleanJSONSchemaRecursive(s.items);
+  }
+
+  // anyOf/oneOf 合并最佳分支
+  const union = Array.isArray(s.anyOf) ? s.anyOf : Array.isArray(s.oneOf) ? s.oneOf : null;
+  if (union && union.length) {
+    const best = pickBestSchema(union);
+    if (best && typeof best === "object") mergeSchemaInto(s, best);
+    delete s.anyOf;
+    delete s.oneOf;
+  }
+
+  if (hasAny(s, ["type", "properties", "items", "enum"])) {
+    // 白名单过滤：移除 Gemini 不认识的字段（$schema / propertyNames / exclusiveMinimum / minLength ...）
+    for (const k of Object.keys(s)) {
+      if (!SCHEMA_ALLOWED.has(k)) delete s[k];
+    }
+    // type 归一化：小写；数组取第一个非 null
+    if (typeof s.type === "string") s.type = s.type.toLowerCase();
+    else if (Array.isArray(s.type)) {
+      s.type = s.type.map((t) => String(t).toLowerCase()).filter((t) => t !== "null")[0] || "string";
+    }
+    // object 无 properties -> 补 reason 字段（对齐原版）
+    if (s.type === "object" && (!s.properties || !Object.keys(s.properties).length)) {
+      s.properties = { reason: { type: "string", description: "Reason for calling this tool" } };
+      s.required = ["reason"];
+    }
+    // required 必须引用存在的 properties
+    if (s.properties && Array.isArray(s.required)) {
+      const valid = s.required.filter((r) => typeof r === "string" && r in s.properties);
+      if (valid.length) s.required = valid;
+      else delete s.required;
+    }
+  }
+  return s;
+}
+
+function cleanJSONSchema(schema) {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return { type: "object", properties: {} };
+  return cleanJSONSchemaRecursive(JSON.parse(JSON.stringify(schema)));
+}
+
 // OpenAI 工具（type:function/function:{name,description,parameters}）-> Gemini functionDeclarations
 function openAIToolsToGemini(tools) {
   if (!Array.isArray(tools) || !tools.length) return undefined;
@@ -427,7 +550,7 @@ function openAIToolsToGemini(tools) {
     funcDecls.push({
       name: fn.name,
       description: fn.description || "",
-      parameters: fn.parameters && typeof fn.parameters === "object" ? fn.parameters : { type: "object", properties: {} },
+      parameters: fn.parameters && typeof fn.parameters === "object" ? cleanJSONSchema(fn.parameters) : { type: "object", properties: {} },
     });
   }
   return funcDecls.length ? [{ functionDeclarations: funcDecls }] : undefined;
@@ -1126,6 +1249,7 @@ function openAIChunkToGemini(j, state) {
       choice.finish_reason === "content_filter" ? "SAFETY" :
       "STOP";
     out.push({ candidates: [{ index: 0, finishReason: fr }] });
+    state.sawGeminiFinish = true;
   }
   if (j.usage) {
     state.usage = { prompt_tokens: j.usage.prompt_tokens || 0, completion_tokens: j.usage.completion_tokens || 0 };
@@ -1493,6 +1617,11 @@ export function makeOpenAIStream(upstreamBody, translator, state, onDone, client
         } else {
           const tail = translator.flush ? (translator.flush(state) || []) : [];
           for (const c of tail) emit(controller, c);
+          // Gemini 客户端（Cherry Studio / Gemini CLI）要求流必须以 finishReason 收尾，
+          // 上游静默结束时补发 STOP，避免 "Response ended with finish reason 'other'"
+          if (clientProtocol === "gemini" && !state.sawGeminiFinish) {
+            controller.enqueue(encoder.encode("data: " + JSON.stringify({ candidates: [{ index: 0, finishReason: "STOP" }] }) + "\n\n"));
+          }
         }
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
         if (onDone) await onDone(state);

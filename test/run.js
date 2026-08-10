@@ -1116,7 +1116,7 @@ async function integrationTests(mock) {
     await ctx.drain();
   });
 
-  await test("空响应自动重试：上游空流 → 自动切换下一个候选账号", async () => {
+  await test("上游 200 空流：直接透传合法空 SSE（不切换账号，避免 codex 流中断）", async () => {
     const { db, env, ctx } = setup();
     // 账号 A：proj-empty（mock 返回空流）优先，账号 B：proj-ok 正常兜底
     await seedAccount(db, {
@@ -1139,19 +1139,21 @@ async function integrationTests(mock) {
       }),
       env, ctx
     );
-    eq(r.status, 200, "重试后返回 200");
+    eq(r.status, 200, "透传 200");
     const sse = await readBody(r);
     const chunks = parseSSE(sse);
+    // 合法空流：有收尾 finish chunk + [DONE]，但无文本
     const texts = chunks.filter((c) => c.choices && c.choices[0].delta && c.choices[0].delta.content).map((c) => c.choices[0].delta.content);
-    eq(texts.join(""), "Hello world", "内容来自第二个账号（重试成功）");
+    eq(texts.join(""), "", "空流无文本（不切换账号）");
+    assert(chunks.some((c) => c.choices && c.choices[0].finish_reason), "含 finish_reason 收尾");
+    assert(sse.includes("[DONE]"), "以 [DONE] 结束");
     const agCalls = mock.calls.slice(callStart).filter((c) => c.host === "cloudcode-pa.googleapis.com");
-    eq(agCalls.length, 2, "两个候选账号都被尝试");
-    eq(agCalls[0].body.project, "proj-empty", "先试空响应账号");
-    eq(agCalls[1].body.project, "proj-ok", "再试正常账号");
+    eq(agCalls.length, 1, "只试了空响应账号，未切换");
+    eq(agCalls[0].body.project, "proj-empty", "用的空响应账号");
     await ctx.drain();
   });
 
-  await test("空响应自动重试（非流式）：上游空 JSON → 自动切换下一个候选账号", async () => {
+  await test("上游 200 空 JSON（非流式）：直接透传，不切换账号", async () => {
     const { db, env, ctx } = setup();
     await seedAccount(db, {
       provider: "antigravity", name: "ag-empty", type: "oauth",
@@ -1173,9 +1175,42 @@ async function integrationTests(mock) {
       }),
       env, ctx
     );
-    eq(r.status, 200, "重试后返回 200");
+    eq(r.status, 200, "透传 200");
     const j = await r.json();
-    eq(j.choices[0].message.content, "Hello world", "内容来自第二个账号（非流式重试成功）");
+    eq(j.choices[0].message.content || "", "", "空内容原样透传");
+    const agCalls = mock.calls.slice(callStart).filter((c) => c.host === "cloudcode-pa.googleapis.com");
+    eq(agCalls.length, 1, "未切换账号");
+    await ctx.drain();
+  });
+
+  await test("上游错误状态（429）：自动切换下一个候选账号", async () => {
+    const { db, env, ctx } = setup();
+    await seedAccount(db, {
+      provider: "antigravity", name: "ag-429", type: "oauth",
+      credentials: { access_token: "ya29.one", refresh_token: "1//rt", project_id: "proj-ok" },
+      priority: 1,
+    });
+    await seedAccount(db, {
+      provider: "antigravity", name: "ag-ok", type: "oauth",
+      credentials: { access_token: "ya29.two", refresh_token: "1//rt", project_id: "proj-ok" },
+      priority: 2,
+    });
+    const key = await seedKey(db);
+    mock.nextStatus = 429; // 下一次上游调用强制 429
+    const callStart = mock.calls.length;
+    const r = await worker.fetch(
+      new Request("https://x/v1/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer " + key, "content-type": "application/json" },
+        body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 100, stream: true, messages: [{ role: "user", content: "hi" }] }),
+      }),
+      env, ctx
+    );
+    eq(r.status, 200, "429 后切换账号返回 200");
+    const sse = await readBody(r);
+    const chunks = parseSSE(sse);
+    const texts = chunks.filter((c) => c.choices && c.choices[0].delta && c.choices[0].delta.content).map((c) => c.choices[0].delta.content);
+    eq(texts.join(""), "Hello world", "内容来自第二个账号（错误切换成功）");
     const agCalls = mock.calls.slice(callStart).filter((c) => c.host === "cloudcode-pa.googleapis.com");
     eq(agCalls.length, 2, "两个候选账号都被尝试");
     await ctx.drain();
@@ -1260,6 +1295,57 @@ async function integrationTests(mock) {
     const md = evs.find((e) => e.type === "message_delta");
     eq(md.delta.stop_reason, "tool_use", "stop_reason 为 tool_use");
     assert(evs.some((e) => e.type === "message_stop"), "以 message_stop 结束");
+    await ctx.drain();
+  });
+
+  await test("POST /v1/messages 带含 $schema 的 tools：Gemini 上游收到白名单清理后的 parameters", async () => {
+    const { db, env, ctx } = setup();
+    await seedAccount(db, {
+      provider: "antigravity", name: "ag-schema", type: "oauth",
+      credentials: { access_token: "ya29.test", refresh_token: "1//rt", project_id: "proj-1" },
+    });
+    const key = await seedKey(db);
+    const callStart = mock.calls.length;
+    const r = await worker.fetch(
+      new Request("https://x/v1/messages", {
+        method: "POST",
+        headers: { "x-api-key": key, "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-6", max_tokens: 100, stream: true,
+          tools: [{
+            name: "Bash", description: "Run a bash command",
+            input_schema: {
+              $schema: "https://json-schema.org/draft/2020-12/schema",
+              type: "object",
+              properties: {
+                command: { type: "string", minLength: 1, "$schema": "x" },
+                timeout: { type: "integer", exclusiveMinimum: 0 },
+              },
+              required: ["command"],
+              propertyNames: { pattern: "^[a-z]" },
+              additionalProperties: false,
+            },
+          }],
+          messages: [{ role: "user", content: "run ls" }],
+        }),
+      }),
+      env, ctx
+    );
+    eq(r.status, 200, "status 200");
+    const sse = await readBody(r);
+    assert(sse.includes("tool_use"), "返回 tool_use");
+    const agCalls = mock.calls.slice(callStart).filter((c) => c.host === "cloudcode-pa.googleapis.com");
+    assert(agCalls.length > 0, "发往 antigravity 上游");
+    const decl = agCalls[0].body.request.tools[0].functionDeclarations[0];
+    eq(decl.name, "Bash", "工具名");
+    const p = decl.parameters;
+    assert(!("$schema" in p), "顶层 $schema 已移除");
+    assert(!("propertyNames" in p), "propertyNames 已移除");
+    assert(!("additionalProperties" in p), "additionalProperties 已移除");
+    assert(!("minLength" in p.properties.command), "属性里的 minLength 已移除");
+    assert(!("exclusiveMinimum" in p.properties.timeout), "属性里的 exclusiveMinimum 已移除");
+    eq(p.properties.command.type, "string", "type 保留");
+    eq(JSON.stringify(p.required), JSON.stringify(["command"]), "required 保留");
     await ctx.drain();
   });
 
