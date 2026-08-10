@@ -38,6 +38,21 @@ export default {
           out.d1_error = String((e && e.message) || e).slice(0, 200);
         }
       }
+      // 上游连通性探测（只探测固定域名、只读、无凭据）：
+      //   api.openai.com —— OpenAI 平台 API（API Key 账号路径），美国地区应返回 401（非 403 地区封锁）
+      //   chatgpt.com    —— ChatGPT 内部 API（OAuth 账号路径），Cloudflare IP 常被其防火墙 1020 封锁
+      out.upstream = {};
+      for (const [name, u] of Object.entries({
+        "api.openai.com": "https://api.openai.com/v1/models",
+        "chatgpt.com": "https://chatgpt.com/backend-api/codex/responses",
+      })) {
+        try {
+          const r = await fetch(u, { method: "GET", signal: AbortSignal.timeout(8000) });
+          out.upstream[name] = { status: r.status, ok: r.ok };
+        } catch (e) {
+          out.upstream[name] = { error: String((e && e.message) || e).slice(0, 120) };
+        }
+      }
       return json(out);
     }
     if (path === "/") {
