@@ -733,47 +733,58 @@ function parseProbeResult(v) {
   return { ok: false, latency_ms: null, error: String(v == null ? "health check failed" : v).slice(0, 200) };
 }
 
-// 单账号连通测试：仿原版 TestAccountConnection，获取模型列表 + 发送测试消息
-async function testAccountConnection(row, env) {
-  const db = env.DB;
+// 获取账号可用模型列表：model_map 优先；antigravity 无公开列表端点直接用默认；
+// 其余平台尝试上游 /models（失败/无结果回退 model_map 或平台默认）
+async function accountModels(row) {
   const acct = { ...row, credentials: row.credentials, model_map: safeJson(row.model_map, {}) };
   const platform = acct.platform;
   const base = (acct.base_url && acct.base_url.trim()) || DEFAULT_BASE[platform];
+  const cred = credentialFor(acct);
+  const token = cred.token || "";
+  const modelKeys = Object.keys(safeJson(acct.model_map, {}));
+  const antigravityDefaults = (DEFAULT_MODELS.antigravity || []);
+  if (modelKeys.length) return modelKeys;
+  if (platform === "antigravity") return [...antigravityDefaults];
+  try {
+    const v1 = /\/v1\/?$/.test(base) ? "" : "/v1";
+    const modelUrl = platform === "gemini" ? `${base}/v1beta/models?key=${encodeURIComponent(token)}` : `${base}${v1}/models`;
+    const headers = platform === "anthropic"
+      ? { "content-type": "application/json", "x-api-key": token }
+      : { "content-type": "application/json", authorization: "Bearer " + token };
+    const mr = await fetch(modelUrl, { method: "GET", headers, signal: AbortSignal.timeout(8000) });
+    if (mr.ok) {
+      const mj = await mr.json().catch(() => ({}));
+      const data = mj.data || mj.models || mj;
+      if (Array.isArray(data)) return data.map((m) => m.id || m.name || "").filter(Boolean);
+      if (data && typeof data === "object") return Object.keys(data);
+    }
+  } catch (e) { /* 模型获取失败回退 */ }
+  return [];
+}
+
+// 单账号连通测试：仿原版 TestAccountConnection，获取模型列表 + 发送测试消息
+// modelId 可选：前端选中的测试模型；为空时自动取 model_map 第一个或平台默认
+async function testAccountConnection(row, env, modelId) {
+  const db = env.DB;
+  const acct = { ...row, credentials: row.credentials, model_map: safeJson(row.model_map, {}) };
+  const platform = acct.platform;
   const cred = credentialFor(acct);
   const token = cred.token || "";
   const models = safeJson(acct.model_map, {});
   const modelKeys = Object.keys(models);
   // antigravity 无公开模型列表端点，使用内置默认模型（与原版 sub2api 一致）
   const antigravityDefaults = (DEFAULT_MODELS.antigravity || []);
-  const testModel = modelKeys[0] || (platform === "antigravity" ? (antigravityDefaults[0] || "gpt-4o-mini") : "gpt-4o-mini");
-  const headers = { "content-type": "application/json" };
+  const availableModels = await accountModels(row);
+  const testModel = (modelId && modelId.trim()) || modelKeys[0] ||
+    (platform === "antigravity" ? (antigravityDefaults[0] || "gpt-4o-mini") : "gpt-4o-mini");
   const result = {
     ok: false,
-    models: modelKeys.length ? modelKeys : (platform === "antigravity" ? [...antigravityDefaults] : []),
+    models: availableModels,
     test_message: null,
     error: null,
   };
 
-  // 1. 获取模型列表（非必需，失败不中断测试）；antigravity 无公开模型列表端点，跳过请求直接使用默认模型
-  if (platform !== "antigravity") {
-    try {
-      const v1 = /\/v1\/?$/.test(base) ? "" : "/v1";
-      const modelUrl = platform === "gemini" ? `${base}/v1beta/models?key=${encodeURIComponent(token)}` : `${base}${v1}/models`;
-      const mh = platform === "anthropic" ? { ...headers, "x-api-key": token } : { ...headers, authorization: "Bearer " + token };
-      const mr = await fetch(modelUrl, { method: "GET", headers: mh, signal: AbortSignal.timeout(8000) });
-      if (mr.ok) {
-        const mj = await mr.json().catch(() => ({}));
-        const data = mj.data || mj.models || mj;
-        if (Array.isArray(data)) {
-          result.models = data.map((m) => m.id || m.name || "").filter(Boolean);
-        } else if (data && typeof data === "object") {
-          result.models = Object.keys(data);
-        }
-      }
-    } catch (e) { /* 模型获取失败不中断 */ }
-  }
-
-  // 2. 发送测试消息
+  // 发送测试消息
   try {
     const testBody = {
       model: testModel,
@@ -971,6 +982,12 @@ async function handleAdmin(request, env, url) {
       if (res.error) return json({ error: res.error }, 400);
       return json({ ok: true, id: res.id });
     }
+    // GET /admin/accounts/:id/models —— 账号可用模型列表（测试连接弹窗选择用）
+    if (request.method === "GET" && sub && sub2 === "models") {
+      const row = await db.prepare("SELECT * FROM accounts_v2 WHERE id=?").bind(sub).first();
+      if (!row) return json({ error: "account not found" }, 404);
+      return json(await accountModels(row));
+    }
     // GET /admin/accounts/:id/usage —— 单账号用量流水
     if (request.method === "GET" && sub && sub2 === "usage") {
       const rows = await db
@@ -999,11 +1016,12 @@ async function handleAdmin(request, env, url) {
         await db.prepare("UPDATE accounts_v2 SET status='active', error_message=NULL WHERE id=?").bind(sub).run();
         return json({ ok: true });
       }
-      // POST /admin/accounts/:id/test —— 单账号连通测试（获取模型 + 发送测试消息，仿原版 TestAccountConnection）
+      // POST /admin/accounts/:id/test —— 单账号连通测试（可选 body.model_id 指定测试模型）
       if (sub2 === "test") {
         const row = await db.prepare("SELECT * FROM accounts_v2 WHERE id=?").bind(sub).first();
         if (!row) return json({ error: "account not found" }, 404);
-        const result = await testAccountConnection(row, env);
+        const b = await request.json().catch(() => ({}));
+        const result = await testAccountConnection(row, env, b && b.model_id);
         return json(result);
       }
     }

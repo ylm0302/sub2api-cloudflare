@@ -497,8 +497,29 @@ function clearAcctError(id){
 function testAccount(id){
   var a=findAccount(id);
   if(!a) return;
-  var m=modal("<div style='text-align:center'><div class='sub' style='margin:20px 0'>测试连接中…</div></div>");
-  api("/admin/accounts/"+id+"/test",{method:"POST"}).then(function(r){
+  var m=openModal("🔌 账号连通测试 · "+esc(a.name),
+    '<div class="sub">正在获取可用模型…</div>',
+    '<button class="btn" onclick="closeModal()">关闭</button>');
+  api("/admin/accounts/"+id+"/models").then(function(models){
+    var list=models||[];
+    if(!list.length){ runAccountTest(id,"",m); return; }
+    var opts='<option value="">默认模型</option>';
+    list.forEach(function(md){ opts+='<option value="'+esc(md)+'">'+esc(md)+"</option>"; });
+    var body='<div class="m-sub">选择测试模型，点击「开始测试」。</div>'+
+      '<label>测试模型</label><select id="tm_model">'+opts+"</select>"+
+      '<div class="hint">账号 model_map 配置的模型优先；antigravity 使用平台默认模型。</div>';
+    m.querySelector(".modal-body").innerHTML=body;
+    m.querySelector(".foot").innerHTML='<button class="btn" onclick="closeModal()">关闭</button>'+
+      '<button class="btn primary" onclick="runAccountTest('+id+', $(&#39;tm_model&#39;).value, this)">开始测试</button>';
+  }).catch(function(e){
+    m.querySelector(".modal-body").innerHTML='<span class="badge b-error">获取模型失败：'+esc(e.message)+"</span>";
+  });
+}
+function runAccountTest(id, modelId, btn){
+  var mask=document.getElementById("activeModalMask");
+  if(btn){btn.disabled=true;btn.textContent="测试中…";}
+  if(mask){mask.querySelector(".modal-body").innerHTML='<div class="sub">测试连接中…</div>';}
+  api("/admin/accounts/"+id+"/test",{method:"POST",body:JSON.stringify({model_id:modelId||""})}).then(function(r){
     var html='<div class="card" style="margin:0 0 12px">';
     html+='<div style="font-weight:700;margin-bottom:6px">🔌 账号连通测试结果</div>';
     html+='<div>'+(r.ok?badge("b-active","✓ 通过"):badge("b-error","✗ 失败"))+"</div></div>";
@@ -516,9 +537,9 @@ function testAccount(id){
       html+='</div>';
     }
     if(r.error) html+='<div class="card" style="border-color:var(--red)"><div style="color:var(--red)">'+esc(r.error)+'</div></div>';
-    m.innerHTML=html;
+    if(mask){mask.querySelector(".modal-body").innerHTML=html;}
   }).catch(function(e){
-    m.innerHTML='<div class="card" style="text-align:center;color:var(--red)">请求失败: '+esc(e.message)+'</div>';
+    if(mask){mask.querySelector(".modal-body").innerHTML='<div class="card" style="text-align:center;color:var(--red)">请求失败: '+esc(e.message)+'</div>';}
   });
 }
 function deleteAccount(id){
