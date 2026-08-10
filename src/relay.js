@@ -22,8 +22,8 @@ export const ANTIGRAVITY_BASES = [
 ];
 
 // Antigravity OAuth 客户端（Google OAuth）—— 密钥通过环境变量设置，见 README.md
-//   ANTIGRAVITY_OAUTH_CLIENT_ID     — 必须
-//   ANTIGRAVITY_OAUTH_CLIENT_SECRET — 必须
+//   ANTIGRAVITY_OAUTH_CLIENT_ID     — 必须（wrangler secret put）
+//   ANTIGRAVITY_OAUTH_CLIENT_SECRET — 必须（wrangler secret put）
 
 // OAuth 刷新端点（已核实）
 export const OAUTH_TOKEN_URL = {
@@ -260,10 +260,10 @@ export async function refreshOAuth(platform, cred, env) {
   const params = new URLSearchParams();
   params.set("grant_type", "refresh_token");
   params.set("refresh_token", cred.refresh_token);
-  // Antigravity 账号的 credentials 不含 client_id，使用官方 Antigravity OAuth 客户端（可用环境变量覆盖）
+  // Antigravity 账号的 credentials 不含 client_id，使用环境变量配置的 OAuth 客户端
   if (platform === "antigravity") params.set("client_id", cred.client_id || (env && env.ANTIGRAVITY_OAUTH_CLIENT_ID) || "");
   else if (cred.client_id) params.set("client_id", cred.client_id);
-  // Google 系（gemini/antigravity）需要 client_secret；antigravity 有内置默认值，可用环境变量覆盖
+  // Google 系（gemini/antigravity）需要 client_secret；antigravity 从环境变量读取
   if (platform === "gemini" && env && env.GEMINI_OAUTH_CLIENT_SECRET) {
     params.set("client_secret", env.GEMINI_OAUTH_CLIENT_SECRET);
   } else if (platform === "antigravity") {

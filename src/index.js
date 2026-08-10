@@ -2,7 +2,6 @@
 import {
   buildUpstream, makeOpenAIStream, openaiPassTranslator,
   DEFAULT_BASE, OAUTH_TOKEN_URL, needsOAuthRefresh, refreshOAuth,
-  ANTIGRAVITY_CLIENT_ID, ANTIGRAVITY_CLIENT_SECRET,
   anthropicReqToOpenAI, geminiReqToOpenAI, responsesReqToOpenAI,
   openAIRespToAnthropic, openAIRespToGemini, openAIRespToResponses,
   credentialFor, passthroughTranslator,
@@ -847,12 +846,10 @@ const OAUTH_PROVIDERS = {
   antigravity: {
     authorizeUrl: "https://accounts.google.com/o/oauth2/v2/auth",
     tokenUrl: "https://oauth2.googleapis.com/token",
-    // 与原版 Antigravity-Manager 一致的 scopes 与内置客户端（可用环境变量覆盖）
+    // 与原版 Antigravity-Manager 一致的 scopes；客户端需通过环境变量设置（wrangler secret put）
     scope: "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs",
     clientIdEnv: "ANTIGRAVITY_OAUTH_CLIENT_ID",
     clientSecretEnv: "ANTIGRAVITY_OAUTH_CLIENT_SECRET",
-    defaultClientId: ANTIGRAVITY_CLIENT_ID,
-    defaultClientSecret: ANTIGRAVITY_CLIENT_SECRET,
   },
 };
 
@@ -1099,7 +1096,7 @@ async function handleAdmin(request, env, url) {
       const provider = url.searchParams.get("provider") || "";
       const cfg = OAUTH_PROVIDERS[provider];
       if (!cfg) return json({ error: "unknown provider: " + provider }, 400);
-      const clientId = env[cfg.clientIdEnv] || cfg.defaultClientId;
+      const clientId = env[cfg.clientIdEnv];
       if (!clientId) return json({ error: "OAUTH_CLIENT_ID not configured for " + provider }, 400);
       const state = crypto.randomUUID();
       const redirect = new URL(url.origin + "/admin/oauth/callback");
@@ -1120,8 +1117,8 @@ async function handleAdmin(request, env, url) {
       const code = url.searchParams.get("code") || "";
       const cfg = OAUTH_PROVIDERS[provider];
       if (!cfg || !code) return json({ error: "invalid oauth callback" }, 400);
-      const clientId = env[cfg.clientIdEnv] || cfg.defaultClientId;
-      const clientSecret = env[cfg.clientSecretEnv] || cfg.defaultClientSecret;
+      const clientId = env[cfg.clientIdEnv];
+      const clientSecret = env[cfg.clientSecretEnv];
       if (!clientId || !clientSecret) return json({ error: "oauth client not configured" }, 400);
       const redirect = new URL(url.origin + "/admin/oauth/callback");
       redirect.searchParams.set("provider", provider);
