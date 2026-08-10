@@ -456,9 +456,9 @@ function openAIToAntigravity(body, model, projectId) {
         try { args = JSON.parse(tc.function.arguments || "{}"); } catch {}
         const call = { name: tc.function.name, args };
         if (tc.id) call.id = tc.id;
-        // Gemini 要求 functionCall 带 thoughtSignature（对齐原版：优先真实 signature，缺失用 dummy）
-        call.thoughtSignature = tc.signature || "skip_thought_signature_validator";
-        parts.push({ functionCall: call });
+        // Gemini 要求 functionCall part 带 thoughtSignature（part 级字段，对齐原版 GeminiPart.ThoughtSignature：
+        // 优先真实 signature，缺失用 dummy 跳过校验）
+        parts.push({ functionCall: call, thoughtSignature: tc.signature || "skip_thought_signature_validator" });
       }
     }
     // user tool 消息 -> functionResponse 部分（结果文本内嵌在 response 里，不额外发 text part）

@@ -1296,7 +1296,7 @@ async function integrationTests(mock) {
     assert(agCalls.length > 0, "发往 antigravity 上游");
     const contents = agCalls[0].body.request.contents;
     const fcPart = contents.find((c) => c.role === "model").parts.find((p) => p.functionCall);
-    assert(fcPart && fcPart.functionCall.thoughtSignature, "functionCall 带 thoughtSignature");
+    assert(fcPart && fcPart.thoughtSignature, "functionCall part 带 thoughtSignature");
     const frPart = contents.flatMap((c) => (c.parts || [])).find((p) => p.functionResponse);
     assert(frPart && frPart.functionResponse.name === "Bash", "functionResponse 名称映射正确");
     eq(frPart.functionResponse.response.result, "4", "functionResponse 内容包在 result 里");
