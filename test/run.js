@@ -1313,6 +1313,33 @@ async function integrationTests(mock) {
     eq(uk.used_tokens, 8, "用量落库");
   });
 
+  await test("Gemini 原生流式（入站 → Antigravity）末尾 chunk 必须带 finishReason", async () => {
+    const { db, env, ctx } = setup();
+    await seedAccount(db, {
+      provider: "antigravity", name: "ag", type: "oauth",
+      credentials: { access_token: "ya29.test", refresh_token: "1//rt", project_id: "proj-1" },
+    });
+    const key = await seedKey(db);
+    const r = await worker.fetch(
+      new Request("https://x/v1beta/models/gemini-3.1-pro-high:streamGenerateContent?alt=sse", {
+        method: "POST",
+        headers: { "x-goog-api-key": key, "content-type": "application/json" },
+        body: JSON.stringify({ contents: [{ parts: [{ text: "hi" }] }] }),
+      }),
+      env, ctx
+    );
+    eq(r.status, 200, "status 200");
+    const sse = await readBody(r);
+    const evs = parseSSE(sse);
+    const texts = evs
+      .flatMap((e) => (e.candidates || []).flatMap((c) => (c.content && c.content.parts || []).map((p) => p.text || "")))
+      .filter(Boolean);
+    eq(texts.join(""), "Hello world", "流式文本拼接");
+    const fins = evs.flatMap((e) => (e.candidates || []).map((c) => c.finishReason).filter(Boolean));
+    eq(fins.includes("STOP"), true, "流式末尾带 finishReason STOP（客户端依赖它判定结束）");
+    await ctx.drain();
+  });
+
   await test("GET /v1beta/models 返回 Gemini 风格模型列表", async () => {
     const { db, env, ctx } = setup();
     await seedAccount(db, { provider: "gemini", name: "gm", api_key: "key-g" });

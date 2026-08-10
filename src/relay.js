@@ -876,6 +876,15 @@ function openAIChunkToGemini(j, state) {
   const text = choice.delta?.content || "";
   const out = [];
   if (text) out.push({ candidates: [{ index: 0, content: { role: "model", parts: [{ text }] } }] });
+  // Gemini 流式协议要求结束 chunk 带 finishReason，否则客户端（Cherry Studio / Gemini CLI）
+  // 报 "stream ended without a finish reason" / "finish reason other"（见 gemini-cli issue #10678）
+  if (choice.finish_reason) {
+    const fr =
+      choice.finish_reason === "length" ? "MAX_TOKENS" :
+      choice.finish_reason === "content_filter" ? "SAFETY" :
+      "STOP";
+    out.push({ candidates: [{ index: 0, finishReason: fr }] });
+  }
   if (j.usage) {
     state.usage = { prompt_tokens: j.usage.prompt_tokens || 0, completion_tokens: j.usage.completion_tokens || 0 };
     out.push({
