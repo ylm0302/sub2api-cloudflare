@@ -857,9 +857,11 @@ const OAUTH_PROVIDERS = {
   grok: {
     authorizeUrl: "https://auth.x.ai/oauth2/authorize",
     tokenUrl: "https://auth.x.ai/oauth2/token",
-    scope: "openid email offline_access",
+    // 对齐原版 xai.DefaultScope；官方客户端为公开客户端（无 client_secret）
+    scope: "openid profile email offline_access grok-cli:access api:access",
     clientIdEnv: "GROK_OAUTH_CLIENT_ID",
-    clientSecretEnv: "GROK_OAUTH_CLIENT_SECRET",
+    // xAI 官方默认客户端（环境变量可覆盖）——与原版 sub2api 一致
+    defaultClientId: "b1a00492-073a-47ea-816f-4c329264a828",
   },
   antigravity: {
     authorizeUrl: "https://accounts.google.com/o/oauth2/v2/auth",
