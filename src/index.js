@@ -278,7 +278,7 @@ async function handleChat(request, env, ctx, protocol = "openai", geminiMeta = n
     }
     attempted++;
     const retryable = tried.size < candidates.length;
-    const result = await relayToUpstream(upstream, acct, openaiBody, keyRow, env, ctx, protocol, retryable);
+    const result = await relayToUpstream(upstream, acct, openaiBody, keyRow, env, ctx, protocol, retryable, request.signal);
     if (result && result.__emptyRetry) {
       // 空响应/上游错误：软隔离该账号 60s，避免后续请求继续命中，再试下一个候选
       await db
@@ -322,8 +322,10 @@ async function relaySameProtocol(request, env, ctx, acct, rawBody, keyRow, proto
       method: "POST",
       headers,
       body: JSON.stringify(rawBody),
+      signal: request.signal,
     });
   } catch (e) {
+    if (request.signal && request.signal.aborted) return json({ error: "client disconnected" }, 499);
     await markAccountError(env, acct.id, "upstream unreachable: " + String(e));
     return json({ error: "upstream unreachable", detail: String(e) }, 502);
   }
@@ -491,7 +493,7 @@ export function __resetRuntimeState() {
 
 // clientProtocol：客户端期望的响应协议（"openai" | "anthropic" | "gemini"）。
 // 上游响应统一转成 OpenAI 格式后，再转回客户端协议。
-async function relayToUpstream(upstream, acct, body, keyRow, env, ctx, clientProtocol = "openai", retryEmpty = false) {
+async function relayToUpstream(upstream, acct, body, keyRow, env, ctx, clientProtocol = "openai", retryEmpty = false, signal = null) {
   const model = (safeJson(acct.model_map, {})[body.model]) || body.model;
   let upstreamResp;
   try {
@@ -499,8 +501,11 @@ async function relayToUpstream(upstream, acct, body, keyRow, env, ctx, clientPro
       method: "POST",
       headers: upstream.headers,
       body: upstream.body,
+      signal,
     });
   } catch (e) {
+    // 客户端断开导致的 abort：不需要标记账号错误，直接透传中断
+    if (signal && signal.aborted) return json({ error: "client disconnected" }, 499);
     await markAccountError(env, acct.id, "upstream unreachable: " + String(e));
     return json({ error: "upstream unreachable", detail: String(e) }, 502);
   }

@@ -280,6 +280,37 @@ async function unitTests() {
     eq(o.messages[2].content, "yo", "text block 内容");
   });
 
+  await test("anthropicReqToOpenAI: tools + tool_use/tool_result 转换", () => {
+    const o = anthropicReqToOpenAI({
+      model: "claude-3",
+      max_tokens: 100,
+      stream: true,
+      tools: [
+        { name: "Bash", description: "Run a bash command", input_schema: { type: "object", properties: { command: { type: "string" } } } },
+        { type: "custom", name: "mcp__filesystem", custom: { description: "FS ops", input_schema: { type: "object" } } },
+      ],
+      messages: [
+        { role: "user", content: "run ls" },
+        { role: "assistant", content: [{ type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "ls" } }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "file1\nfile2" }] },
+      ],
+    });
+    eq(o.tools.length, 2, "tools 转换数量");
+    eq(o.tools[0].type, "function", "工具类型 function");
+    eq(o.tools[0].function.name, "Bash", "工具名");
+    eq(o.tools[0].function.parameters.type, "object", "input_schema -> parameters");
+    eq(o.tools[1].function.name, "mcp__filesystem", "custom 工具用 custom.input_schema");
+    // assistant tool_use -> tool_calls
+    const asst = o.messages.find((m) => m.role === "assistant");
+    eq(asst.tool_calls.length, 1, "tool_calls");
+    eq(asst.tool_calls[0].function.name, "Bash", "tool_call 函数名");
+    eq(JSON.parse(asst.tool_calls[0].function.arguments).command, "ls", "tool_call 参数");
+    // user tool_result -> tool 消息
+    const toolMsg = o.messages.find((m) => m.role === "tool");
+    eq(toolMsg.tool_call_id, "toolu_1", "tool_call_id");
+    eq(toolMsg.content, "file1\nfile2", "tool 结果内容");
+  });
+
   await test("geminiReqToOpenAI: contents/generationConfig 转换", () => {
     const o = geminiReqToOpenAI({
       contents: [{ role: "user", parts: [{ text: "hi" }] }],
@@ -1195,6 +1226,70 @@ async function integrationTests(mock) {
     const texts = evs.filter((e) => e.type === "content_block_delta").map((e) => e.delta.text);
     eq(texts.join(""), "Hello world", "文本拼接");
     assert(evs.some((e) => e.type === "message_stop"), "以 message_stop 结束");
+    await ctx.drain();
+  });
+
+  await test("POST /v1/messages 带 tools（Claude Code）→ Antigravity 流式返回 tool_use", async () => {
+    const { db, env, ctx } = setup();
+    await seedAccount(db, {
+      provider: "antigravity", name: "ag-tools", type: "oauth",
+      credentials: { access_token: "ya29.test", refresh_token: "1//rt", project_id: "proj-1" },
+    });
+    const key = await seedKey(db);
+    const r = await worker.fetch(
+      new Request("https://x/v1/messages", {
+        method: "POST",
+        headers: { "x-api-key": key, "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-6", max_tokens: 100, stream: true,
+          tools: [{ name: "Bash", description: "Run a bash command", input_schema: { type: "object", properties: { command: { type: "string" } } } }],
+          messages: [{ role: "user", content: "run ls" }],
+        }),
+      }),
+      env, ctx
+    );
+    eq(r.status, 200, "status 200");
+    const sse = await readBody(r);
+    const evs = parseSSE(sse);
+    assert(evs.some((e) => e.type === "message_start"), "含 message_start");
+    const toolStart = evs.find((e) => e.type === "content_block_start" && e.content_block && e.content_block.type === "tool_use");
+    assert(toolStart, "含 tool_use content_block_start");
+    eq(toolStart.content_block.name, "Bash", "tool_use 名称");
+    const jsonDelta = evs.filter((e) => e.type === "content_block_delta" && e.delta.type === "input_json_delta").map((e) => e.delta.partial_json).join("");
+    assert(jsonDelta.includes("echo hi"), "input_json_delta 携带参数");
+    const md = evs.find((e) => e.type === "message_delta");
+    eq(md.delta.stop_reason, "tool_use", "stop_reason 为 tool_use");
+    assert(evs.some((e) => e.type === "message_stop"), "以 message_stop 结束");
+    await ctx.drain();
+  });
+
+  await test("POST /v1/messages 带 tools 非流式 → Antigravity 返回 tool_use 内容块", async () => {
+    const { db, env, ctx } = setup();
+    await seedAccount(db, {
+      provider: "antigravity", name: "ag-tools2", type: "oauth",
+      credentials: { access_token: "ya29.test", refresh_token: "1//rt", project_id: "proj-1" },
+    });
+    const key = await seedKey(db);
+    const r = await worker.fetch(
+      new Request("https://x/v1/messages", {
+        method: "POST",
+        headers: { "x-api-key": key, "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-6", max_tokens: 100,
+          tools: [{ name: "Bash", description: "Run a bash command", input_schema: { type: "object", properties: { command: { type: "string" } } } }],
+          messages: [{ role: "user", content: "run ls" }],
+        }),
+      }),
+      env, ctx
+    );
+    eq(r.status, 200, "status 200");
+    const j = await r.json();
+    eq(j.type, "message", "Anthropic 响应格式");
+    const tu = j.content.find((b) => b.type === "tool_use");
+    assert(tu, "含 tool_use 内容块");
+    eq(tu.name, "Bash", "tool_use 名称");
+    eq(tu.input.command, "echo hi", "tool_use 参数");
+    eq(j.stop_reason, "tool_use", "stop_reason 为 tool_use");
     await ctx.drain();
   });
 

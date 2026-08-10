@@ -401,14 +401,73 @@ export function antigravityModelFor(rawCred, model) {
 // OpenAI chat 请求 -> Antigravity v1internal（Gemini 风格）请求
 // v1internal 端点：POST {base}/v1internal:generateContent | :streamGenerateContent?alt=sse
 // 请求体：{ project, requestId, userAgent:"antigravity", requestType:"agent", model, request:{...} }
+// 基于第一条 user 消息内容生成稳定 session ID（对齐原版 generateStableSessionID）：
+// 重连/重试时同一对话复用同一 session，避免上游把重连当作新对话重新生成（codex 重连重复数据）
+function stableSessionId(contents) {
+  for (const c of contents) {
+    if (c.role !== "user" || !c.parts || !c.parts.length) continue;
+    const text = c.parts.map((p) => p.text || "").join("");
+    if (text) {
+      let h = 0;
+      for (let i = 0; i < text.length; i++) { h = ((h << 5) - h + text.charCodeAt(i)) | 0; }
+      return "-" + Math.abs(h);
+    }
+  }
+  return uid();
+}
+
+// OpenAI 工具（type:function/function:{name,description,parameters}）-> Gemini functionDeclarations
+function openAIToolsToGemini(tools) {
+  if (!Array.isArray(tools) || !tools.length) return undefined;
+  const funcDecls = [];
+  for (const t of tools) {
+    if (!t || typeof t !== "object") continue;
+    const fn = t.type === "function" ? t.function : t;
+    if (!fn || !fn.name) continue;
+    funcDecls.push({
+      name: fn.name,
+      description: fn.description || "",
+      parameters: fn.parameters && typeof fn.parameters === "object" ? fn.parameters : { type: "object", properties: {} },
+    });
+  }
+  return funcDecls.length ? [{ functionDeclarations: funcDecls }] : undefined;
+}
+
 function openAIToAntigravity(body, model, projectId) {
   const { system, rest } = splitSystem(body.messages || []);
-  const contents = rest.map((m) => ({
-    role: m.role === "assistant" ? "model" : "user",
-    parts: [{ text: msgText(m.content) }],
-  }));
-  const request = { contents, sessionId: uid() };
+  const contents = [];
+  for (const m of rest) {
+    const role = m.role === "assistant" ? "model" : m.role === "tool" ? "user" : "user";
+    const parts = [];
+    // assistant tool_calls -> functionCall 部分
+    if (m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+      for (const tc of m.tool_calls) {
+        if (!tc || tc.type !== "function" || !tc.function || !tc.function.name) continue;
+        let args = {};
+        try { args = JSON.parse(tc.function.arguments || "{}"); } catch {}
+        parts.push({ functionCall: { name: tc.function.name, args } });
+      }
+    }
+    // user tool 消息 -> functionResponse 部分（结果文本内嵌在 response 里，不额外发 text part）
+    if (m.role === "tool" && m.tool_call_id) {
+      const name = m.name || "tool";
+      let resp;
+      try { resp = JSON.parse(m.content); } catch { resp = { output: String(m.content == null ? "" : m.content) }; }
+      parts.push({ functionResponse: { name, response: resp } });
+    } else {
+      const text = msgText(m.content);
+      if (text) parts.push({ text });
+    }
+    if (!parts.length) parts.push({ text: "" });
+    contents.push({ role, parts });
+  }
+  const request = { contents, sessionId: stableSessionId(contents) };
   if (system) request.systemInstruction = { role: "user", parts: [{ text: system }] };
+  const tools = openAIToolsToGemini(body.tools);
+  if (tools) {
+    request.tools = tools;
+    request.toolConfig = { functionCallingConfig: { mode: "VALIDATED" } };
+  }
   const gc = {};
   if (body.max_tokens != null) gc.maxOutputTokens = body.max_tokens;
   if (body.temperature != null) gc.temperature = body.temperature;
@@ -435,13 +494,31 @@ function mapAntigravityFinish(fr) {
   if (fr === "MALFORMED_FUNCTION_CALL") return "tool_calls";
   return "stop";
 }
+// Gemini functionCall 部分 -> OpenAI tool_calls 数组
+function geminiFunctionCallsToOpenAI(parts) {
+  const toolCalls = [];
+  for (const p of parts) {
+    const fc = p && p.functionCall;
+    if (!fc || !fc.name) continue;
+    toolCalls.push({
+      id: fc.id || ("call_" + fc.name + "_" + Math.random().toString(36).slice(2, 8)),
+      type: "function",
+      function: { name: fc.name, arguments: JSON.stringify(fc.args || {}) },
+    });
+  }
+  return toolCalls.length ? toolCalls : undefined;
+}
+
 export function antigravityToOpenAI(j, model) {
   const resp = unwrapV1Resp(j);
   const parts = resp.candidates?.[0]?.content?.parts || [];
   const text = parts.filter((p) => p.text != null && !p.thought).map((p) => p.text).join("");
+  const toolCalls = geminiFunctionCallsToOpenAI(parts);
   const u = resp.usageMetadata || {};
   const pTok = u.promptTokenCount || 0;
   const cTok = (u.candidatesTokenCount || 0) + (u.thoughtsTokenCount || 0);
+  // 出现 functionCall 时强制 finish=tool_calls（对齐原版：usedTool -> stop_reason "tool_use"）
+  const fr = toolCalls ? "tool_calls" : mapAntigravityFinish(resp.candidates?.[0]?.finishReason);
   return {
     id: "chatcmpl-ag" + Date.now(),
     object: "chat.completion",
@@ -449,8 +526,8 @@ export function antigravityToOpenAI(j, model) {
     model,
     choices: [{
       index: 0,
-      message: { role: "assistant", content: text || null },
-      finish_reason: mapAntigravityFinish(resp.candidates?.[0]?.finishReason),
+      message: { role: "assistant", content: text || null, tool_calls: toolCalls },
+      finish_reason: fr,
     }],
     usage: {
       prompt_tokens: pTok,
@@ -467,6 +544,7 @@ const antigravityTranslator = {
     const resp = unwrapV1Resp(j);
     const parts = resp.candidates?.[0]?.content?.parts || [];
     const text = parts.filter((p) => p.text != null && !p.thought).map((p) => p.text).join("");
+    const toolCalls = geminiFunctionCallsToOpenAI(parts);
     const out = [];
     // 注意：用独立 flag（trStarted），避免与 makeOpenAIStream 客户端协议转换器（openAIChunkToAnthropic 等）共用的 state.started 冲突
     if (!state.trStarted) {
@@ -480,6 +558,7 @@ const antigravityTranslator = {
       });
     }
     if (text) out.push({ id: "x", object: "chat.completion.chunk", choices: [{ index: 0, delta: { content: text }, finish_reason: null }] });
+    if (toolCalls) out.push({ id: "x", object: "chat.completion.chunk", choices: [{ index: 0, delta: { tool_calls: toolCalls }, finish_reason: null }] });
     if (resp.usageMetadata) {
       const u = resp.usageMetadata;
       state.usage = {
@@ -489,7 +568,14 @@ const antigravityTranslator = {
       };
     }
     const fr = resp.candidates?.[0]?.finishReason;
-    if (fr) state.finishReason = mapAntigravityFinish(fr);
+    // 出现 functionCall 时强制 finish=tool_calls（对齐原版：usedTool -> stop_reason "tool_use"），
+    // 一旦出现过工具调用就保持 tool_calls，避免后续无 parts 的 finishReason chunk 覆盖
+    if (toolCalls) {
+      state.sawToolCalls = true;
+      state.finishReason = "tool_calls";
+    } else if (!state.sawToolCalls && fr) {
+      state.finishReason = mapAntigravityFinish(fr);
+    }
     return out;
   },
   flush(state) {
@@ -519,6 +605,68 @@ function msgText(content) {
 }
 
 // Anthropic /v1/messages 请求 -> OpenAI chat 请求（保持 stream / max_tokens 等）
+// Claude 工具 schema（name/description/input_schema）-> OpenAI chat tools 格式
+function claudeToolsToOpenAI(tools) {
+  if (!Array.isArray(tools) || !tools.length) return undefined;
+  const out = [];
+  for (const t of tools) {
+    if (!t || typeof t !== "object") continue;
+    // MCP custom 工具：{type:"custom", name, custom:{input_schema}}
+    const schema = t.type === "custom" ? (t.custom && t.custom.input_schema) : t.input_schema;
+    const name = t.name;
+    if (!name) continue;
+    out.push({
+      type: "function",
+      function: {
+        name,
+        description: (t.type === "custom" && t.custom && t.custom.description) || t.description || "",
+        parameters: schema && typeof schema === "object" ? schema : { type: "object", properties: {} },
+      },
+    });
+  }
+  return out.length ? out : undefined;
+}
+
+// Claude 消息内容块 -> OpenAI 消息列表（text / tool_use -> tool_calls；tool_result -> tool 角色）
+function claudeContentToOpenAIMessages(m, messages) {
+  const content = m.content;
+  if (typeof content === "string") {
+    messages.push({ role: m.role === "assistant" ? "assistant" : "user", content });
+    return;
+  }
+  if (!Array.isArray(content)) return;
+  const role = m.role === "assistant" ? "assistant" : "user";
+  // 拆分：文本 / tool_use / tool_result
+  const textParts = [];
+  const toolUses = [];
+  const toolResults = [];
+  for (const b of content) {
+    if (!b || typeof b !== "object") continue;
+    if (b.type === "tool_use") toolUses.push(b);
+    else if (b.type === "tool_result") toolResults.push(b);
+    else if (b.type === "text" || typeof b.text === "string") textParts.push(b.text);
+    else if (b.type === "thinking" || b.type === "redacted_thinking") { /* 丢弃思考块，上游由系统提示接管 */ }
+  }
+  const text = textParts.join("");
+  if (toolResults.length) {
+    // 每个 tool_result 独立成一条 tool 消息（OpenAI 要求 tool_call_id 与 assistant tool_calls 一一对应）
+    for (const tr of toolResults) {
+      let result = tr.content;
+      if (Array.isArray(result)) result = result.map((p) => (typeof p === "string" ? p : p && p.text != null ? p.text : JSON.stringify(p))).join("");
+      messages.push({ role: "tool", tool_call_id: tr.tool_use_id, content: String(result == null ? "" : result) });
+    }
+  } else if (role === "assistant" && toolUses.length) {
+    const msg = { role: "assistant", content: text || null, tool_calls: toolUses.map((tu) => ({
+      id: tu.id || ("call_" + Math.random().toString(36).slice(2, 10)),
+      type: "function",
+      function: { name: tu.name, arguments: JSON.stringify(tu.input || {}) },
+    })) };
+    messages.push(msg);
+  } else if (text || !toolUses.length) {
+    messages.push({ role, content: text });
+  }
+}
+
 export function anthropicReqToOpenAI(body) {
   const messages = [];
   if (body.system) {
@@ -526,15 +674,17 @@ export function anthropicReqToOpenAI(body) {
     if (sys) messages.push({ role: "system", content: sys });
   }
   for (const m of body.messages || []) {
-    const role = m.role === "assistant" ? "assistant" : "user";
-    messages.push({ role, content: msgText(m.content) });
+    claudeContentToOpenAIMessages(m, messages);
   }
+  if (!messages.length) messages.push({ role: "user", content: "" });
   const out = {
     model: body.model,
     messages,
     stream: !!body.stream,
     max_tokens: body.max_tokens ?? 1024,
   };
+  const tools = claudeToolsToOpenAI(body.tools);
+  if (tools) out.tools = tools;
   if (body.temperature != null) out.temperature = body.temperature;
   if (body.top_p != null) out.top_p = body.top_p;
   if (Array.isArray(body.stop_sequences) && body.stop_sequences.length) out.stop = body.stop_sequences;
@@ -664,14 +814,26 @@ export function geminiToOpenAI(j, model) {
 export function openAIRespToAnthropic(j, model) {
   const choice = (j.choices || [])[0] || {};
   const text = choice.message?.content || "";
+  const toolCalls = (choice.message && Array.isArray(choice.message.tool_calls) ? choice.message.tool_calls : [])
+    .filter((tc) => tc && tc.type === "function" && tc.function && tc.function.name);
   const u = j.usage || {};
+  const content = [];
+  if (text) content.push({ type: "text", text });
+  for (const tc of toolCalls) {
+    let input = {};
+    try { input = JSON.parse(tc.function.arguments || "{}"); } catch {}
+    content.push({ type: "tool_use", id: tc.id || ("toolu_" + Date.now()), name: tc.function.name, input });
+  }
   return {
     id: "msg_" + Date.now(),
     type: "message",
     role: "assistant",
     model,
-    content: text ? [{ type: "text", text }] : [],
-    stop_reason: choice.finish_reason === "length" ? "max_tokens" : "end_turn",
+    content,
+    stop_reason:
+      choice.finish_reason === "tool_calls" ? "tool_use" :
+      choice.finish_reason === "length" ? "max_tokens" :
+      "end_turn",
     stop_sequence: null,
     usage: {
       input_tokens: u.prompt_tokens || 0,
@@ -814,6 +976,8 @@ export function openAIRespToGemini(j, model) {
 // ---------- 出站协议适配：OpenAI 流式 chunk -> Anthropic / Gemini SSE ----------
 
 // OpenAI chat chunk -> Anthropic SSE 事件列表
+// 支持 text + tool_calls（delta.tool_calls -> tool_use 块 + input_json_delta），
+// 兼容增量式（OpenAI 原生逐段 arguments）与整块式（Gemini functionCall 一次性给出）两种上游。
 function openAIChunkToAnthropic(j, state) {
   const out = [];
   const choice = (j.choices || [])[0] || {};
@@ -821,22 +985,73 @@ function openAIChunkToAnthropic(j, state) {
   const text = delta.content;
   if (!state.started) {
     state.started = true;
+    state.blockIndex = 0;
+    state.currentBlock = null; // "text" | "tool_use" | null
+    state.toolState = new Map(); // tool index -> { id, name, args, started }
     out.push({
       type: "message_start",
       message: { id: "msg_" + Date.now(), type: "message", role: "assistant", model: state.model, content: [], usage: { input_tokens: 0, output_tokens: 0 } },
     });
-    out.push({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
   }
-  if (text) out.push({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text } });
+  const closeBlock = () => {
+    if (state.currentBlock) {
+      out.push({ type: "content_block_stop", index: state.blockIndex - 1 });
+      state.currentBlock = null;
+    }
+  };
+  const openTextBlock = () => {
+    if (state.currentBlock === "text") return;
+    closeBlock();
+    out.push({ type: "content_block_start", index: state.blockIndex++, content_block: { type: "text", text: "" } });
+    state.currentBlock = "text";
+  };
+  if (text) {
+    openTextBlock();
+    out.push({ type: "content_block_delta", index: state.blockIndex - 1, delta: { type: "text_delta", text } });
+  }
+  if (Array.isArray(delta.tool_calls)) {
+    for (const tc of delta.tool_calls) {
+      if (!tc || typeof tc !== "object") continue;
+      const key = tc.index != null ? tc.index : 0;
+      let ts = state.toolState.get(key);
+      if (!ts) {
+        ts = { id: tc.id || "", name: (tc.function && tc.function.name) || "", args: "", started: false };
+        state.toolState.set(key, ts);
+      }
+      if (tc.id) ts.id = tc.id;
+      if (tc.function && tc.function.name) ts.name = tc.function.name;
+      if (tc.function && tc.function.arguments) ts.args += tc.function.arguments;
+      if (!ts.started) {
+        if (state.currentBlock === "text") closeBlock();
+        const id = ts.id || ("toolu_" + Date.now() + "_" + key);
+        out.push({
+          type: "content_block_start",
+          index: state.blockIndex++,
+          content_block: { type: "tool_use", id, name: ts.name || "function", input: {} },
+        });
+        ts.started = true;
+        state.currentBlock = "tool_use";
+      }
+      if (tc.function && tc.function.arguments) {
+        out.push({ type: "content_block_delta", index: state.blockIndex - 1, delta: { type: "input_json_delta", partial_json: tc.function.arguments } });
+      }
+    }
+  }
   if (j.usage) {
     state.usage = { prompt_tokens: j.usage.prompt_tokens || 0, completion_tokens: j.usage.completion_tokens || 0 };
     state.outputTokens = j.usage.completion_tokens || 0;
   }
   if (choice.finish_reason) {
-    out.push({ type: "content_block_stop", index: 0 });
+    closeBlock();
     out.push({
       type: "message_delta",
-      delta: { stop_reason: choice.finish_reason === "length" ? "max_tokens" : "end_turn", stop_sequence: null },
+      delta: {
+        stop_reason:
+          choice.finish_reason === "tool_calls" ? "tool_use" :
+          choice.finish_reason === "length" ? "max_tokens" :
+          "end_turn",
+        stop_sequence: null,
+      },
       usage: { output_tokens: state.outputTokens || 0 },
     });
     state.finished = true;
@@ -857,12 +1072,21 @@ function flushAnthropic(state) {
     out.push({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
     out.push({ type: "content_block_stop", index: 0 });
   } else if (!state.finished) {
-    out.push({ type: "content_block_stop", index: 0 });
+    // 未收到 finish_reason（上游提前断流）：关闭当前打开的块（text 或 tool_use）
+    if (state.currentBlock) out.push({ type: "content_block_stop", index: state.blockIndex - 1 });
   }
   if (!state.finished) {
+    // 用 translator 累积的 finishReason（如 antigravity 的 tool_calls）决定 stop_reason
+    const fr = state.finishReason || "";
     out.push({
       type: "message_delta",
-      delta: { stop_reason: "end_turn", stop_sequence: null },
+      delta: {
+        stop_reason:
+          fr === "tool_calls" ? "tool_use" :
+          fr === "length" ? "max_tokens" :
+          "end_turn",
+        stop_sequence: null,
+      },
       usage: { output_tokens: state.outputTokens || 0 },
     });
   }
@@ -901,36 +1125,74 @@ function openAIChunkToGemini(j, state) {
 
 // OpenAI chat chunk -> Responses API SSE 事件（/v1/responses 流式出站转换）
 // 返回 { event, data } 列表；响应体字段名与官方 Responses streaming 事件一致。
+// 支持 text（output_text）与 tool_calls（function_call 项）。
 function openAIChunkToResponses(j, state) {
   const out = [];
   const choice = (j.choices || [])[0] || {};
-  const text = choice.delta?.content;
+  const delta = choice.delta || {};
+  const text = delta.content;
   if (!state.started) {
     state.started = true;
     state.responseId = "resp_" + Date.now();
-    state.outputItemId = "msg_" + Date.now();
-    state.contentPartId = "pc_" + Date.now();
+    state.items = []; // { kind: "message" | "function_call", id, outputIndex, text?, callId?, name?, args? }
+    state.toolState = new Map();
     state.model = state.model || j.model || "";
     const created = Math.floor(Date.now() / 1000);
     out.push({
       event: "response.created",
       data: { type: "response.created", response: { id: state.responseId, object: "response", created_at: created, status: "in_progress", model: state.model, output: [] } },
     });
+  }
+  // 惰性创建 text 消息项（首个文本 chunk 时）
+  const ensureTextItem = () => {
+    let item = state.items.find((i) => i.kind === "message");
+    if (item) return item;
+    item = { kind: "message", id: "msg_" + Date.now(), outputIndex: state.items.length, text: "" };
+    state.items.push(item);
     out.push({
       event: "response.output_item.added",
-      data: { type: "response.output_item.added", output_index: 0, item: { id: state.outputItemId, type: "message", status: "in_progress", role: "assistant", content: [] } },
+      data: { type: "response.output_item.added", output_index: item.outputIndex, item: { id: item.id, type: "message", status: "in_progress", role: "assistant", content: [] } },
     });
     out.push({
       event: "response.content_part.added",
-      data: { type: "response.content_part.added", item_id: state.outputItemId, output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } },
+      data: { type: "response.content_part.added", item_id: item.id, output_index: item.outputIndex, content_index: 0, part: { type: "output_text", text: "", annotations: [] } },
     });
-  }
+    return item;
+  };
   if (text) {
+    const item = ensureTextItem();
     out.push({
       event: "response.output_text.delta",
-      data: { type: "response.output_text.delta", item_id: state.outputItemId, output_index: 0, content_index: 0, delta: text },
+      data: { type: "response.output_text.delta", item_id: item.id, output_index: item.outputIndex, content_index: 0, delta: text },
     });
-    state.text = (state.text || "") + text;
+    item.text += text;
+  }
+  if (Array.isArray(delta.tool_calls)) {
+    for (const tc of delta.tool_calls) {
+      if (!tc || typeof tc !== "object") continue;
+      const key = tc.index != null ? tc.index : 0;
+      let ts = state.toolState.get(key);
+      if (!ts) {
+        // function_call 项在文本项之后追加（output_index 递增）
+        const item = { kind: "function_call", id: "fc_" + Date.now() + "_" + key, outputIndex: state.items.length, callId: tc.id || ("call_" + Date.now() + "_" + key), name: (tc.function && tc.function.name) || "", args: "" };
+        state.items.push(item);
+        ts = { item, started: false };
+        state.toolState.set(key, ts);
+        out.push({
+          event: "response.output_item.added",
+          data: { type: "response.output_item.added", output_index: item.outputIndex, item: { id: item.id, type: "function_call", status: "in_progress", call_id: item.callId, name: item.name, arguments: "" } },
+        });
+      }
+      if (tc.id) ts.item.callId = tc.id;
+      if (tc.function && tc.function.name) ts.item.name = tc.function.name;
+      if (tc.function && tc.function.arguments) {
+        ts.item.args += tc.function.arguments;
+        out.push({
+          event: "response.function_call_arguments.delta",
+          data: { type: "response.function_call_arguments.delta", item_id: ts.item.id, output_index: ts.item.outputIndex, delta: tc.function.arguments },
+        });
+      }
+    }
   }
   if (j.usage) {
     state.usage = { prompt_tokens: j.usage.prompt_tokens || 0, completion_tokens: j.usage.completion_tokens || 0 };
@@ -944,29 +1206,47 @@ function flushResponses(state) {
   if (!state.started) {
     state.started = true;
     state.responseId = "resp_" + Date.now();
-    state.outputItemId = "msg_" + Date.now();
+    state.items = [];
     state.model = state.model || "";
     out.push({
       event: "response.created",
       data: { type: "response.created", response: { id: state.responseId, object: "response", created_at: Math.floor(Date.now() / 1000), status: "in_progress", model: state.model, output: [] } },
     });
   }
-  // 无论上游是否已带 finish_reason，都必须补发 done/completed 收尾事件（仅在此 flush 一次）
-  const text = state.text || "";
+  // 无任何项时补一个空 text 项，保证 response.completed 的 output 非空
+  if (!state.items.length) {
+    const item = { kind: "message", id: "msg_" + Date.now(), outputIndex: 0, text: "" };
+    state.items.push(item);
+  }
+  const output = [];
+  for (const item of state.items) {
+    if (item.kind === "message") {
+      const text = item.text || "";
+      out.push({ event: "response.output_text.done", data: { type: "response.output_text.done", item_id: item.id, output_index: item.outputIndex, content_index: 0, text } });
+      out.push({ event: "response.content_part.done", data: { type: "response.content_part.done", item_id: item.id, output_index: item.outputIndex, content_index: 0, part: { type: "output_text", text, annotations: [] } } });
+      out.push({
+        event: "response.output_item.done",
+        data: { type: "response.output_item.done", output_index: item.outputIndex, item: { id: item.id, type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text, annotations: [] }] } },
+      });
+      output.push({ id: item.id, type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text, annotations: [] }] });
+    } else if (item.kind === "function_call") {
+      const args = item.args || "";
+      out.push({ event: "response.function_call_arguments.done", data: { type: "response.function_call_arguments.done", item_id: item.id, output_index: item.outputIndex, arguments: args } });
+      out.push({
+        event: "response.output_item.done",
+        data: { type: "response.output_item.done", output_index: item.outputIndex, item: { id: item.id, type: "function_call", status: "completed", call_id: item.callId, name: item.name, arguments: args } },
+      });
+      output.push({ id: item.id, type: "function_call", status: "completed", call_id: item.callId, name: item.name, arguments: args });
+    }
+  }
   const u = state.usage || {};
-  out.push({ event: "response.output_text.done", data: { type: "response.output_text.done", item_id: state.outputItemId, output_index: 0, content_index: 0, text } });
-  out.push({ event: "response.content_part.done", data: { type: "response.content_part.done", item_id: state.outputItemId, output_index: 0, content_index: 0, part: { type: "output_text", text, annotations: [] } } });
-  out.push({
-    event: "response.output_item.done",
-    data: { type: "response.output_item.done", output_index: 0, item: { id: state.outputItemId, type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text, annotations: [] }] } },
-  });
   out.push({
     event: "response.completed",
     data: {
       type: "response.completed",
       response: {
         id: state.responseId, object: "response", created_at: Math.floor(Date.now() / 1000), status: "completed", model: state.model,
-        output: [{ id: state.outputItemId, type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text, annotations: [] }] }],
+        output,
         usage: {
           input_tokens: u.prompt_tokens || 0,
           input_tokens_details: { cached_tokens: 0 },
@@ -1226,7 +1506,8 @@ export function makeOpenAIStreamRetryable(upstreamBody, translator, state, onDon
   function chunkHasContent(c) {
     if (!c || typeof c !== "object") return false;
     const d = (c.choices && c.choices[0] && c.choices[0].delta) || {};
-    return typeof d.content === "string" && d.content.length > 0;
+    if (typeof d.content === "string" && d.content.length > 0) return true;
+    return Array.isArray(d.tool_calls) && d.tool_calls.length > 0;
   }
 
   function emit(controller, c) {

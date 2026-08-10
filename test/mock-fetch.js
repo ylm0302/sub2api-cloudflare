@@ -131,6 +131,27 @@ function mockAntigravity(body, u) {
       headers: { "content-type": "application/json" },
     });
   }
+  // 请求带 tools（functionDeclarations）时模拟 functionCall 响应：
+  // 验证 Claude Code 工具链（tools -> functionDeclarations -> functionCall -> tool_use）
+  const reqHasTools = body && body.request && Array.isArray(body.request.tools) && body.request.tools.length > 0;
+  if (reqHasTools) {
+    const fc = { name: "Bash", args: { command: "echo hi" } };
+    const isStream2 = u.pathname.endsWith("streamGenerateContent");
+    if (isStream2) {
+      const sse = [
+        `data: ${JSON.stringify({ response: { candidates: [{ index: 0, content: { role: "model", parts: [{ functionCall: fc }] } }] } })}`,
+        `data: ${JSON.stringify({ response: { candidates: [{ index: 0, content: { role: "model", parts: [] }, finishReason: "STOP" }], usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 3 } } })}`,
+        `data: [DONE]`,
+      ].join("\n\n");
+      return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }
+    return new Response(JSON.stringify({
+      response: {
+        candidates: [{ index: 0, content: { role: "model", parts: [{ functionCall: fc }] }, finishReason: "STOP" }],
+        usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 3 },
+      },
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  }
   const geminiResp = (text) => ({
     response: {
       candidates: [{ index: 0, content: { role: "model", parts: [{ text }] }, finishReason: "STOP" }],
