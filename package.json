@@ -1,0 +1,16 @@
+{
+  "name": "sub2api-cf",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Workers + D1 的轻量 AI API 中转站（sub2api 精简版）",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "test": "node --experimental-sqlite test/run.js",
+    "test:loop": "node test/loop.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}

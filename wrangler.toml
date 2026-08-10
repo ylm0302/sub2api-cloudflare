@@ -1,0 +1,22 @@
+name = "sub2api-cf"
+main = "src/index.js"
+compatibility_date = "2025-06-01"
+compatibility_flags = ["nodejs_compat"]
+
+# D1 数据库绑定
+[[d1_databases]]
+binding = "DB"
+database_name = "sub2api-cf"
+database_id = "852335e8-9613-44ac-ba34-de9c22e554d5"
+
+# 自定义域名（Cloudflare 自动建 DNS 并关联到本 Worker，无需手动 CNAME）
+
+# Cron：每 10 分钟执行 scheduled() —— 刷新临近过期的 OAuth token、
+# 检查订阅/兑换码是否过期、对渠道做健康探测并标记异常账号
+[triggers]
+crons = ["*/10 * * * *"]
+
+# 密钥（不要用明文写在文件里，用 `wrangler secret put` 设置）：
+#   ADMIN_TOKEN  —— 管理后台 / 管理 API 的访问令牌
+#   GEMINI_OAUTH_CLIENT_SECRET —— 可选，Gemini OAuth 刷新需要
+# 设置命令见 README.md
