@@ -448,7 +448,14 @@ async function relayToUpstream(upstream, acct, body, keyRow, env, ctx, clientPro
     try {
       openai = JSON.parse(text);
       if (upstream.translateResponse) openai = upstream.translateResponse(openai);
-    } catch { openai = null; }
+    } catch {
+      // openai OAuth 上游强制流式（chatgpt.com codex），客户端请求非流式时聚合 SSE 为完整响应
+      if (upstream.forceStreamUpstream && text.includes("\ndata: ")) {
+        openai = sseResponsesToOpenAI(text, model);
+      } else {
+        openai = null;
+      }
+    }
     const usage = openai && openai.usage;
     if (usage) ctx.waitUntil(logUsage(env, keyRow, acct, model, usage));
     let out = text;
@@ -493,6 +500,36 @@ function tryUsage(jsonText) {
     if (j && j.usage) return j.usage;
   } catch {}
   return null;
+}
+
+// 把 chatgpt.com codex（openai OAuth）的 SSE 流聚合为 OpenAI chat 响应（非流式客户端）
+function sseResponsesToOpenAI(text, model) {
+  let content = "";
+  let usage = null;
+  for (const line of text.split("\n")) {
+    const t = line.trim();
+    if (!t.startsWith("data:")) continue;
+    const data = t.slice(5).trim();
+    if (data === "[DONE]") continue;
+    let j; try { j = JSON.parse(data); } catch { continue; }
+    if (j.type === "response.output_text.delta" && j.delta) content += j.delta;
+    if (j.type === "response.completed" && j.response && j.response.usage) {
+      const u = j.response.usage;
+      usage = {
+        prompt_tokens: u.input_tokens || 0,
+        completion_tokens: u.output_tokens || 0,
+        total_tokens: (u.input_tokens || 0) + (u.output_tokens || 0),
+      };
+    }
+  }
+  return {
+    id: "chatcmpl-" + Date.now(),
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
+    usage: usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+  };
 }
 
 // ---------- 模型列表 / 用量 / token 计数 ----------
@@ -776,7 +813,8 @@ async function testAccountConnection(row, env, modelId) {
   const antigravityDefaults = (DEFAULT_MODELS.antigravity || []);
   const availableModels = await accountModels(row);
   const testModel = (modelId && modelId.trim()) || modelKeys[0] ||
-    (platform === "antigravity" ? (antigravityDefaults[0] || "gpt-4o-mini") : "gpt-4o-mini");
+    (platform === "antigravity" ? (antigravityDefaults[0] || "gpt-4o-mini") :
+      platform === "openai" ? "gpt-5.4" : "gpt-4o-mini");
   const result = {
     ok: false,
     models: availableModels,

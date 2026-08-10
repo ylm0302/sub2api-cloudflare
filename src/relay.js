@@ -106,26 +106,34 @@ export function buildUpstream(acct, body) {
         role: m.role === "assistant" ? "assistant" : m.role === "system" ? "system" : "user",
         content: [{ type: "input_text", text: msgText(m.content) }],
       }));
+      // Codex 模型归一化：与真实转发一致（gpt-5.3 -> gpt-5.3-codex、gpt-5 -> gpt-5.4 等）
+      const upstreamModel = normalizeCodexModel(model);
       const out = {
-        model,
+        model: upstreamModel,
         input: input.length ? input : [{ role: "user", content: [{ type: "input_text", text: "hi" }] }],
         stream: true, // ChatGPT Codex API 强制流式（实测 stream:false 返回 400）
         store: false,
       };
       if (system) out.instructions = system;
+      const headers = {
+        "content-type": "application/json",
+        authorization: `Bearer ${cred.token}`,
+        accept: "text/event-stream",
+        "OpenAI-Beta": "responses=experimental",
+        originator: "codex-tui",
+        "user-agent": "codex-tui/0.44.4",
+      };
+      // 账号级 ChatGPT 账号标识头（对齐原版 setOpenAIChatGPTAccountHeaders）
+      const rawCred = safeCred(acct);
+      if (rawCred && rawCred.chatgpt_account_id) headers["chatgpt-account-id"] = rawCred.chatgpt_account_id;
       return {
         provider: platform,
-        isStream: true,
+        // 上游强制流式，但按客户端意图标记 isStream，便于 relayToUpstream 决定聚合为 JSON 还是透传 SSE
+        isStream,
+        forceStreamUpstream: true,
         credential: cred,
         url: "https://chatgpt.com/backend-api/codex/responses",
-        headers: {
-          "content-type": "application/json",
-          authorization: `Bearer ${cred.token}`,
-          accept: "text/event-stream",
-          "OpenAI-Beta": "responses=experimental",
-          originator: "codex-tui",
-          "user-agent": "codex-tui/0.44.4",
-        },
+        headers,
         body: JSON.stringify(out),
         translateResponse: responsesRespToOpenAI,
         translator: responsesTranslator,
@@ -670,6 +678,58 @@ export function openAIRespToAnthropic(j, model) {
       output_tokens: u.completion_tokens || 0,
     },
   };
+}
+
+// Codex 模型归一化（对齐原版 openai_codex_transform.go 的 codexModelMap）
+// openai OAuth 账号（ChatGPT Codex）上游只认 codex 模型名，如 gpt-5.3 -> gpt-5.3-codex、gpt-5 -> gpt-5.4
+const CODEX_MODEL_MAP = {
+  "gpt-5.6-sol": "gpt-5.6-sol",
+  "gpt-5.6-terra": "gpt-5.6-terra",
+  "gpt-5.6-luna": "gpt-5.6-luna",
+  "gpt-5.5": "gpt-5.5",
+  "gpt-5.5-pro": "gpt-5.5-pro",
+  "codex-auto-review": "codex-auto-review",
+  "gpt-5.4": "gpt-5.4",
+  "gpt-5.4-mini": "gpt-5.4-mini",
+  "gpt-5.4-none": "gpt-5.4",
+  "gpt-5.4-low": "gpt-5.4",
+  "gpt-5.4-medium": "gpt-5.4",
+  "gpt-5.4-high": "gpt-5.4",
+  "gpt-5.4-xhigh": "gpt-5.4",
+  "gpt-5.4-chat-latest": "gpt-5.4",
+  "gpt-5.3": "gpt-5.3-codex",
+  "gpt-5.3-none": "gpt-5.3-codex",
+  "gpt-5.3-low": "gpt-5.3-codex",
+  "gpt-5.3-medium": "gpt-5.3-codex",
+  "gpt-5.3-high": "gpt-5.3-codex",
+  "gpt-5.3-xhigh": "gpt-5.3-codex",
+  "gpt-5.3-codex": "gpt-5.3-codex",
+  "gpt-5.3-codex-spark": "gpt-5.3-codex-spark",
+  "gpt-5.2": "gpt-5.2",
+  "gpt-5.2-none": "gpt-5.2",
+  "gpt-5.2-low": "gpt-5.2",
+  "gpt-5.2-medium": "gpt-5.2",
+  "gpt-5.2-high": "gpt-5.2",
+  "gpt-5.2-xhigh": "gpt-5.2",
+  "gpt-5": "gpt-5.4",
+  "gpt-5-mini": "gpt-5.4",
+  "gpt-5-nano": "gpt-5.4",
+  "gpt-5.1": "gpt-5.4",
+  "gpt-5.1-codex": "gpt-5.3-codex",
+  "gpt-5.1-codex-max": "gpt-5.3-codex",
+  "gpt-5.1-codex-mini": "gpt-5.3-codex",
+  "gpt-5.2-codex": "gpt-5.2",
+  "codex-mini-latest": "gpt-5.3-codex",
+  "gpt-5-codex": "gpt-5.3-codex",
+};
+
+export function normalizeCodexModel(model) {
+  const m = String(model || "").trim();
+  if (!m) return "gpt-5.4";
+  const key = m.split("/").pop().toLowerCase().replace(/\s+/g, "-");
+  if (CODEX_MODEL_MAP[key]) return CODEX_MODEL_MAP[key];
+  // 带日期后缀的版本（如 gpt-5.2-2025-12-11）原样保留；gpt-5.x-chat-latest 类后缀已在上表
+  return m;
 }
 
 // ChatGPT Codex /v1/responses 响应 -> OpenAI chat 响应（openai OAuth 上游转换）
