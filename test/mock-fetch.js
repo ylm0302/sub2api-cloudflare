@@ -38,6 +38,7 @@ export function installFetchMock() {
     if (u.host === "api.anthropic.com") return mockAnthropic(body);
     if (u.host === "generativelanguage.googleapis.com") return mockGemini(body, u);
     if (u.host === "api.x.ai") return mockOpenAI(body); // Grok 走 OpenAI 兼容协议
+    if (u.host === "cloudcode-pa.googleapis.com") return mockAntigravity(body, u);
     return new Response("not found", { status: 404 });
   };
 
@@ -94,6 +95,38 @@ function mockAnthropic(body) {
     }),
     { status: 200, headers: { "content-type": "application/json" } }
   );
+}
+
+function mockAntigravity(body, u) {
+  // 真实 Antigravity v1internal 响应（V1InternalResponse 包装）
+  const geminiResp = (text) => ({
+    response: {
+      candidates: [{ index: 0, content: { role: "model", parts: [{ text }] }, finishReason: "STOP" }],
+      usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 3 },
+      responseId: "resp-ag-1",
+    },
+    modelVersion: "claude-sonnet-4-6",
+  });
+  const isStream = u.pathname.endsWith("streamGenerateContent");
+  if (isStream) {
+    const sse = [
+      `data: ${JSON.stringify({ response: { candidates: [{ index: 0, content: { role: "model", parts: [{ text: "Hello" }] } }] } })}`,
+      `data: ${JSON.stringify({ response: { candidates: [{ index: 0, content: { role: "model", parts: [{ text: " world" }] } }] } })}`,
+      `data: ${JSON.stringify(geminiResp(""))}`,
+      `data: [DONE]`,
+    ].join("\n\n");
+    return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
+  }
+  if (u.pathname.endsWith("fetchAvailableModels")) {
+    return new Response(JSON.stringify({ models: { "claude-sonnet-4-6": { status: "AVAILABLE" } } }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  return new Response(JSON.stringify(geminiResp("Hello world")), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
 }
 
 function mockGemini(body, u) {

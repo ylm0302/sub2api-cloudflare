@@ -12,15 +12,26 @@ export const DEFAULT_BASE = {
   anthropic:  "https://api.anthropic.com",
   gemini:     "https://generativelanguage.googleapis.com",
   grok:       "https://api.x.ai/v1",
-  antigravity:"https://api.anthropic.com", // antigravity 复用 Anthropic 协议（Claude 侧）
+  antigravity:"https://cloudcode-pa.googleapis.com", // 真实 Antigravity（Google）API
 };
+
+// Antigravity API 端点（prod 优先，daily sandbox 备用，与 Antigravity-Manager 一致）
+export const ANTIGRAVITY_BASES = [
+  "https://cloudcode-pa.googleapis.com",
+  "https://daily-cloudcode-pa.sandbox.googleapis.com",
+];
+
+// Antigravity OAuth 客户端（Google OAuth）—— 密钥通过环境变量设置，见 README.md
+//   ANTIGRAVITY_OAUTH_CLIENT_ID     — 必须
+//   ANTIGRAVITY_OAUTH_CLIENT_SECRET — 必须
 
 // OAuth 刷新端点（已核实）
 export const OAUTH_TOKEN_URL = {
   openai:   "https://auth.openai.com/oauth/token",
   gemini:   "https://oauth2.googleapis.com/token",
   grok:     "https://auth.x.ai/oauth2/token",
-  // anthropic/antigravity OAuth 走 sessionKey（cookie），本实现不支持
+  antigravity: "https://oauth2.googleapis.com/token",
+  // anthropic OAuth 走 sessionKey（cookie），本实现不支持
 };
 
 const SUPPORTED_PLATFORMS = Object.keys(DEFAULT_BASE);
@@ -108,8 +119,31 @@ export function buildUpstream(acct, body) {
     };
   }
 
-  // ---------- Anthropic / Antigravity（Claude 协议） ----------
-  if (platform === "anthropic" || platform === "antigravity") {
+  // ---------- Antigravity（真实 Google API，v1internal Gemini 格式） ----------
+  if (platform === "antigravity") {
+    const rawCred = safeCred(acct);
+    const projectId = (rawCred && rawCred.project_id) || "";
+    const upstreamModel = antigravityModelFor(rawCred, model);
+    const payload = openAIToAntigravity(body, upstreamModel, projectId);
+    const action = isStream ? "streamGenerateContent" : "generateContent";
+    return {
+      provider: "antigravity",
+      isStream,
+      credential: cred,
+      url: `${base}/v1internal:${action}${isStream ? "?alt=sse" : ""}`,
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${cred.token}`,
+        "user-agent": "antigravity/1.23.2 windows/amd64",
+      },
+      body: JSON.stringify(payload),
+      translateResponse: (j) => antigravityToOpenAI(j, upstreamModel),
+      translator: antigravityTranslator,
+    };
+  }
+
+  // ---------- Anthropic（Claude 协议） ----------
+  if (platform === "anthropic") {
     const { system, rest } = splitSystem(body.messages || []);
     const payload = {
       model,
@@ -168,7 +202,7 @@ export const DEFAULT_MODELS = {
   anthropic: ["claude-opus-4-1", "claude-sonnet-4-5", "claude-sonnet-4-6", "claude-haiku-4-5", "claude-3-7-sonnet-latest", "claude-3-5-sonnet-latest", "claude-3-5-haiku-latest"],
   gemini: ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"],
   grok: ["grok-4", "grok-3", "grok-3-mini", "grok-2-latest"],
-  antigravity: ["claude-sonnet-4-5", "claude-opus-4-1", "gemini-2.5-pro"],
+  antigravity: ["claude-sonnet-4-6", "claude-opus-4-6-thinking", "claude-haiku-4-5", "gemini-2.5-pro", "gemini-pro-agent", "gemini-2.5-flash"],
 };
 
 // 从账号列表收集对外模型名：优先 model_map 的对外 key，缺省回退平台默认列表
@@ -226,10 +260,14 @@ export async function refreshOAuth(platform, cred, env) {
   const params = new URLSearchParams();
   params.set("grant_type", "refresh_token");
   params.set("refresh_token", cred.refresh_token);
-  if (cred.client_id) params.set("client_id", cred.client_id);
-  // Gemini 需要 client_secret；从 secret 读取（可选）
+  // Antigravity 账号的 credentials 不含 client_id，使用官方 Antigravity OAuth 客户端
+  if (platform === "antigravity") params.set("client_id", cred.client_id || (env && env.ANTIGRAVITY_OAUTH_CLIENT_ID));
+  else if (cred.client_id) params.set("client_id", cred.client_id);
+  // Google 系（gemini/antigravity）需要 client_secret；antigravity 有内置默认值，可用环境变量覆盖
   if (platform === "gemini" && env && env.GEMINI_OAUTH_CLIENT_SECRET) {
     params.set("client_secret", env.GEMINI_OAUTH_CLIENT_SECRET);
+  } else if (platform === "antigravity") {
+    params.set("client_secret", (env && env.ANTIGRAVITY_OAUTH_CLIENT_SECRET) || "");
   }
   const resp = await fetch(url, {
     method: "POST",
@@ -266,6 +304,140 @@ function openAIToGemini(body) {
   if (Object.keys(generationConfig).length) payload.generationConfig = generationConfig;
   return payload;
 }
+
+// ---------- Antigravity（Google v1internal Gemini 格式）适配 ----------
+
+function uid() {
+  try { return crypto.randomUUID(); } catch { return "id-" + Date.now() + "-" + Math.random().toString(36).slice(2, 10); }
+}
+
+// 模型名解析：账号 model_map（对外名 -> 上游名）优先，其次默认别名表，最后透传
+// 默认别名表对齐 sub2api antigravity_model_mapping（新模型替换旧型号）
+const ANTIGRAVITY_MODEL_ALIASES = {
+  "claude-opus-4-6": "claude-opus-4-6-thinking",
+  "claude-opus-4-5": "claude-opus-4-6-thinking",
+  "claude-opus-4-5-thinking": "claude-opus-4-6-thinking",
+  "claude-opus-4-5-20251101": "claude-opus-4-6-thinking",
+  "claude-haiku-4-5": "claude-sonnet-4-6",
+  "claude-haiku-4-5-20251001": "claude-sonnet-4-6",
+  "claude-sonnet-4-5-20250929": "claude-sonnet-4-5",
+};
+export function antigravityModelFor(rawCred, model) {
+  if (rawCred && rawCred.model_mapping && typeof rawCred.model_mapping === "object" && rawCred.model_mapping[model]) {
+    return rawCred.model_mapping[model];
+  }
+  if (ANTIGRAVITY_MODEL_ALIASES[model]) return ANTIGRAVITY_MODEL_ALIASES[model];
+  return model;
+}
+
+// OpenAI chat 请求 -> Antigravity v1internal（Gemini 风格）请求
+// v1internal 端点：POST {base}/v1internal:generateContent | :streamGenerateContent?alt=sse
+// 请求体：{ project, requestId, userAgent:"antigravity", requestType:"agent", model, request:{...} }
+function openAIToAntigravity(body, model, projectId) {
+  const { system, rest } = splitSystem(body.messages || []);
+  const contents = rest.map((m) => ({
+    role: m.role === "assistant" ? "model" : "user",
+    parts: [{ text: msgText(m.content) }],
+  }));
+  const request = { contents, sessionId: uid() };
+  if (system) request.systemInstruction = { role: "user", parts: [{ text: system }] };
+  const gc = {};
+  if (body.max_tokens != null) gc.maxOutputTokens = body.max_tokens;
+  if (body.temperature != null) gc.temperature = body.temperature;
+  if (body.top_p != null) gc.topP = body.top_p;
+  if (Object.keys(gc).length) request.generationConfig = gc;
+  return {
+    project: projectId,
+    requestId: "agent-" + uid(),
+    userAgent: "antigravity",
+    requestType: "agent",
+    model,
+    request,
+  };
+}
+
+// Antigravity v1internal 响应 -> OpenAI chat 响应（解 response 包装；usage 带 thinking tokens）
+function unwrapV1Resp(j) {
+  return j && j.response && typeof j.response === "object" ? j.response : (j || {});
+}
+function mapAntigravityFinish(fr) {
+  if (!fr || fr === "STOP" || fr === "" ) return "stop";
+  if (fr === "MAX_TOKENS") return "length";
+  if (fr === "SAFETY" || fr === "RECITATION" || fr === "BLOCKLIST" || fr === "PROHIBITED_CONTENT") return "content_filter";
+  if (fr === "MALFORMED_FUNCTION_CALL") return "tool_calls";
+  return "stop";
+}
+export function antigravityToOpenAI(j, model) {
+  const resp = unwrapV1Resp(j);
+  const parts = resp.candidates?.[0]?.content?.parts || [];
+  const text = parts.filter((p) => p.text != null && !p.thought).map((p) => p.text).join("");
+  const u = resp.usageMetadata || {};
+  const pTok = u.promptTokenCount || 0;
+  const cTok = (u.candidatesTokenCount || 0) + (u.thoughtsTokenCount || 0);
+  return {
+    id: "chatcmpl-ag" + Date.now(),
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{
+      index: 0,
+      message: { role: "assistant", content: text || null },
+      finish_reason: mapAntigravityFinish(resp.candidates?.[0]?.finishReason),
+    }],
+    usage: {
+      prompt_tokens: pTok,
+      completion_tokens: cTok,
+      total_tokens: pTok + cTok,
+    },
+  };
+}
+
+// Antigravity SSE（data: v1internal 响应）-> OpenAI chunk 翻译器
+const antigravityTranslator = {
+  onData(data, state) {
+    let j; try { j = JSON.parse(data); } catch { return []; }
+    const resp = unwrapV1Resp(j);
+    const parts = resp.candidates?.[0]?.content?.parts || [];
+    const text = parts.filter((p) => p.text != null && !p.thought).map((p) => p.text).join("");
+    const out = [];
+    // 注意：用独立 flag（trStarted），避免与 makeOpenAIStream 客户端协议转换器（openAIChunkToAnthropic 等）共用的 state.started 冲突
+    if (!state.trStarted) {
+      state.trStarted = true;
+      out.push({
+        id: "chatcmpl-ag" + Date.now(),
+        object: "chat.completion.chunk",
+        created: Math.floor(Date.now() / 1000),
+        model: state.model,
+        choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
+      });
+    }
+    if (text) out.push({ id: "x", object: "chat.completion.chunk", choices: [{ index: 0, delta: { content: text }, finish_reason: null }] });
+    if (resp.usageMetadata) {
+      const u = resp.usageMetadata;
+      state.usage = {
+        prompt_tokens: u.promptTokenCount || 0,
+        completion_tokens: (u.candidatesTokenCount || 0) + (u.thoughtsTokenCount || 0),
+        total_tokens: (u.promptTokenCount || 0) + (u.candidatesTokenCount || 0) + (u.thoughtsTokenCount || 0),
+      };
+    }
+    const fr = resp.candidates?.[0]?.finishReason;
+    if (fr) state.finishReason = mapAntigravityFinish(fr);
+    return out;
+  },
+  flush(state) {
+    const u = state.usage || {};
+    return [{
+      id: "x",
+      object: "chat.completion.chunk",
+      choices: [{ index: 0, delta: {}, finish_reason: state.finishReason || "stop" }],
+      usage: {
+        prompt_tokens: u.prompt_tokens || 0,
+        completion_tokens: u.completion_tokens || 0,
+        total_tokens: (u.prompt_tokens || 0) + (u.completion_tokens || 0),
+      },
+    }];
+  },
+};
 
 // ---------- 入站协议适配：Anthropic / Gemini 原生请求 -> 内部 OpenAI 格式 ----------
 
@@ -720,8 +892,8 @@ const geminiTranslator = {
     const parts = j.candidates?.[0]?.content?.parts || [];
     const text = parts.map((p) => p.text || "").join("");
     const out = [];
-    if (!state.started) {
-      state.started = true;
+    if (!state.trStarted) {
+      state.trStarted = true;
       out.push({
         id: "chatcmpl-g" + Date.now(),
         object: "chat.completion.chunk",

@@ -794,6 +794,29 @@ async function integrationTests(mock) {
     eq(auths[0], "Bearer sk-high", "priority 小的先选");
   });
 
+  await test("模型维度路由：各账号只服务自己 model_map 声明的模型", async () => {
+    const { db, env, ctx } = setup();
+    // 两个 openai 账号，priority 相同；只有其中一个声明了 gpt-4o
+    await seedAccountV2(db, { name: "ma-other", platform: "openai", credentials: { api_key: "sk-other" }, model_map: { "gpt-4o-mini": "gpt-4o-mini" }, priority: 10 });
+    await seedAccountV2(db, { name: "ma-gpt4o", platform: "openai", credentials: { api_key: "sk-gpt4o" }, model_map: { "gpt-4o": "gpt-4o" }, priority: 20 });
+    const key = await seedKey(db);
+    const chat = async (model) => {
+      mock.calls.length = 0;
+      const r = await worker.fetch(
+        new Request("https://x/v1/chat/completions", {
+          method: "POST", headers: { authorization: "Bearer " + key, "content-type": "application/json" },
+          body: JSON.stringify({ model, messages: [{ role: "user", content: "hi" }] }),
+        }), env, ctx
+      );
+      await r.json();
+      await ctx.drain();
+      const calls = mock.calls.filter((c) => c.host === "api.openai.com");
+      return (calls[0] && calls[0].headers.authorization) || "";
+    };
+    eq(await chat("gpt-4o"), "Bearer sk-gpt4o", "gpt-4o 路由到声明它的账号（即使 priority 更大）");
+    eq(await chat("gpt-4o-mini"), "Bearer sk-other", "gpt-4o-mini 路由到声明它的账号");
+  });
+
   await test("OAuth 账号：即将过期时自动刷新（mock fetch 命中 refresh 端点）", async () => {
     // 装一个能识别 refresh 端点的 fetch mock
     const orig = globalThis.fetch;
@@ -979,6 +1002,180 @@ async function integrationTests(mock) {
     const texts = evs.filter((e) => e.type === "content_block_delta").map((e) => e.delta.text);
     eq(texts.join(""), "Hello world", "文本拼接");
     assert(evs.some((e) => e.type === "message_stop"), "以 message_stop 结束");
+    await ctx.drain();
+  });
+
+  // ============ Antigravity 真实网关（v1internal Gemini 协议） ============
+
+  await test("POST /v1/chat/completions → Antigravity 账号（非流式，v1internal 转换）", async () => {
+    const { db, env, ctx } = setup();
+    await seedAccount(db, {
+      provider: "antigravity", name: "ag", type: "oauth",
+      credentials: { access_token: "ya29.test", refresh_token: "1//rt", project_id: "proj-1" },
+    });
+    const key = await seedKey(db);
+    const r = await worker.fetch(
+      new Request("https://x/v1/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer " + key, "content-type": "application/json" },
+        body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 100, messages: [{ role: "user", content: "hi" }] }),
+      }),
+      env, ctx
+    );
+    eq(r.status, 200, "status 200");
+    const j = await r.json();
+    eq(j.choices[0].message.content, "Hello world", "Antigravity 上游文本");
+    eq(j.usage.prompt_tokens, 5, "prompt_tokens");
+    eq(j.usage.completion_tokens, 3, "completion_tokens");
+    await ctx.drain();
+    const uk = await db.prepare("SELECT used_tokens FROM user_keys WHERE key=?").bind(key).first();
+    eq(uk.used_tokens, 8, "用量落库");
+    // 上游请求体是 v1internal 格式：含 project + requestId + request.contents
+    const call = mock.calls.find((c) => c.host === "cloudcode-pa.googleapis.com");
+    assert(call, "确实打到 Antigravity 端点");
+    eq(call.url.includes("/v1internal:generateContent"), true, "generateContent 端点");
+    eq(call.body.project, "proj-1", "project_id 传入");
+    eq(call.body.model, "claude-sonnet-4-6", "模型透传");
+    eq(call.body.request.contents[0].parts[0].text, "hi", "消息转换");
+  });
+
+  await test("Antigravity 模型映射：claude-opus-4-6 → claude-opus-4-6-thinking 上游", async () => {
+    const { db, env, ctx } = setup();
+    await seedAccount(db, {
+      provider: "antigravity", name: "ag", type: "oauth",
+      credentials: { access_token: "ya29.test", refresh_token: "1//rt", project_id: "proj-1" },
+    });
+    const key = await seedKey(db);
+    const r = await worker.fetch(
+      new Request("https://x/v1/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer " + key, "content-type": "application/json" },
+        body: JSON.stringify({ model: "claude-opus-4-6", max_tokens: 20, messages: [{ role: "user", content: "hi" }] }),
+      }),
+      env, ctx
+    );
+    eq(r.status, 200, "status 200");
+    const agCalls = mock.calls.filter((c) => c.host === "cloudcode-pa.googleapis.com");
+    const call = agCalls[agCalls.length - 1];
+    eq(call.body.model, "claude-opus-4-6-thinking", "默认别名映射");
+    await ctx.drain();
+  });
+
+  await test("POST /v1/chat/completions → Antigravity 账号（流式 SSE）", async () => {
+    const { db, env, ctx } = setup();
+    await seedAccount(db, {
+      provider: "antigravity", name: "ag", type: "oauth",
+      credentials: { access_token: "ya29.test", refresh_token: "1//rt", project_id: "proj-1" },
+    });
+    const key = await seedKey(db);
+    const r = await worker.fetch(
+      new Request("https://x/v1/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer " + key, "content-type": "application/json" },
+        body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 100, stream: true, messages: [{ role: "user", content: "hi" }] }),
+      }),
+      env, ctx
+    );
+    eq(r.status, 200, "status 200");
+    const sse = await readBody(r);
+    const chunks = parseSSE(sse);
+    const texts = chunks.filter((c) => c.choices && c.choices[0].delta && c.choices[0].delta.content).map((c) => c.choices[0].delta.content);
+    eq(texts.join(""), "Hello world", "流式文本拼接");
+    assert(chunks.some((c) => c.choices && c.choices[0].finish_reason === "stop"), "以 stop 结束");
+    await ctx.drain();
+  });
+
+  await test("POST /v1/messages（Anthropic 入站）→ Antigravity 账号（Claude 协议转换）", async () => {
+    const { db, env, ctx } = setup();
+    await seedAccount(db, {
+      provider: "antigravity", name: "ag", type: "oauth",
+      credentials: { access_token: "ya29.test", refresh_token: "1//rt", project_id: "proj-1" },
+    });
+    const key = await seedKey(db);
+    const r = await worker.fetch(
+      new Request("https://x/v1/messages", {
+        method: "POST",
+        headers: { "x-api-key": key, "content-type": "application/json", "anthropic-version": "2023-06-01" },
+        body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 100, messages: [{ role: "user", content: "hi" }] }),
+      }),
+      env, ctx
+    );
+    eq(r.status, 200, "status 200");
+    const j = await r.json();
+    eq(j.type, "message", "Anthropic 响应格式");
+    eq(j.content[0].text, "Hello world", "内容");
+    eq(j.usage.input_tokens, 5, "input_tokens");
+    await ctx.drain();
+  });
+
+  await test("POST /v1/messages 流式（Anthropic 入站）→ Antigravity 账号", async () => {
+    const { db, env, ctx } = setup();
+    await seedAccount(db, {
+      provider: "antigravity", name: "ag", type: "oauth",
+      credentials: { access_token: "ya29.test", refresh_token: "1//rt", project_id: "proj-1" },
+    });
+    const key = await seedKey(db);
+    const r = await worker.fetch(
+      new Request("https://x/v1/messages", {
+        method: "POST",
+        headers: { "x-api-key": key, "content-type": "application/json" },
+        body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 100, stream: true, messages: [{ role: "user", content: "hi" }] }),
+      }),
+      env, ctx
+    );
+    eq(r.status, 200, "status 200");
+    const sse = await readBody(r);
+    const evs = parseSSE(sse);
+    assert(evs.some((e) => e.type === "message_start"), "含 message_start");
+    const texts = evs.filter((e) => e.type === "content_block_delta").map((e) => e.delta.text);
+    eq(texts.join(""), "Hello world", "文本拼接");
+    assert(evs.some((e) => e.type === "message_stop"), "以 message_stop 结束");
+    await ctx.drain();
+  });
+
+  await test("Antigravity OAuth 刷新：过期 token 自动走 Google oauth2 刷新", async () => {
+    const { db, env, ctx } = setup();
+    await seedAccount(db, {
+      provider: "antigravity", name: "ag", type: "oauth",
+      credentials: { access_token: "ya29.stale", refresh_token: "1//rt", project_id: "proj-1", expires_at: Date.now() - 1000 },
+    });
+    const key = await seedKey(db);
+    // mock 里给 oauth2.googleapis.com 返回新 token
+    const orig = globalThis.fetch;
+    globalThis.fetch = async (url, opts = {}) => {
+      const u = new URL(String(url));
+      if (u.host === "oauth2.googleapis.com" && u.pathname === "/token") {
+        return new Response(JSON.stringify({ access_token: "ya29.fresh", expires_in: 3600, token_type: "Bearer" }), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }
+      return orig(url, opts);
+    };
+    try {
+      const r = await worker.fetch(
+        new Request("https://x/v1/chat/completions", {
+          method: "POST",
+          headers: { authorization: "Bearer " + key, "content-type": "application/json" },
+          body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 100, messages: [{ role: "user", content: "hi" }] }),
+        }),
+        env, ctx
+      );
+      eq(r.status, 200, "刷新后调用成功");
+      const j = await r.json();
+      eq(j.choices[0].message.content, "Hello world", "内容");
+      // 新 token 已写回
+      const row = await db.prepare("SELECT credentials FROM accounts_v2 WHERE name=?").bind("ag").first();
+      const cred = JSON.parse(row.credentials);
+      if (cred.access_token !== "ya29.fresh") {
+        const st = await db.prepare("SELECT status, error_message FROM accounts_v2 WHERE name=?").bind("ag").first();
+        console.error("  [debug] status=", st.status, "err=", st.error_message);
+        console.error("  [debug] creds=", row.credentials);
+        console.error("  [debug] last calls=", JSON.stringify(mock.calls.slice(-4).map((c) => c.host + c.url.replace(/^https?:\/\/[^/]+/, ""))));
+      }
+      eq(cred.access_token, "ya29.fresh", "新 access_token 写回");
+    } finally {
+      globalThis.fetch = orig;
+    }
     await ctx.drain();
   });
 
@@ -1217,6 +1414,107 @@ async function integrationTests(mock) {
     eq(await cnt("SELECT COUNT(*) AS n FROM promo_codes"), 1, "重复导入兑换码不重复");
     eq(await cnt("SELECT COUNT(*) AS n FROM announcements"), 1, "重复导入公告不重复");
     eq(await cnt("SELECT COUNT(*) AS n FROM model_limits"), 1, "重复导入限流不重复");
+  });
+
+  await test("POST /admin/accounts/import 支持 NDJSON（每行一个账号对象）", async () => {
+    const { db, env, ctx } = setup();
+    const H = { "x-admin-token": "test-admin-token", "content-type": "application/json" };
+    const ndjson = JSON.stringify({ id: 1, name: "acc-a", platform: "openai", type: "oauth", credentials: { access_token: "sk-a", refresh_token: "rt-a", expires_at: 1700000000 } })
+      + "\n"
+      + JSON.stringify({ id: 2, name: "acc-b", platform: "gemini", type: "oauth", credentials: { access_token: "sk-b", refresh_token: "rt-b" } })
+      + "\n";
+    const r = await worker.fetch(
+      new Request("https://x/admin/accounts/import", { method: "POST", headers: H, body: ndjson }),
+      env, ctx
+    );
+    eq(r.status, 200, "status 200");
+    const j = await r.json();
+    eq(j.total, 2, "total=2");
+    eq(j.created, 2, "created=2");
+    eq(j.failed, 0, "no failures");
+    const a = await db.prepare("SELECT platform, expires_at FROM accounts_v2 WHERE name=? AND platform=?").bind("acc-a", "openai").first();
+    eq(a.platform, "openai", "acc-a platform");
+    eq(a.expires_at, 1700000000000, "expires_at 秒->毫秒");
+  });
+
+  await test("POST /admin/accounts/import 修复 \\\" 双重转义损坏行（原版 Go 导出）", async () => {
+    const { db, env, ctx } = setup();
+    const H = { "x-admin-token": "test-admin-token", "content-type": "application/json" };
+    // 原版导出的 temp_unschedulable_reason 里出现 \\"，导致整行不是合法 JSON
+    const badLine = JSON.stringify({ id: 26, name: "B #2", platform: "grok", type: "oauth", credentials: { access_token: "sk-grok", refresh_token: "rt-grok" } })
+      .replace("}", ",\"temp_unschedulable_reason\":\"token refresh retry exhausted: code=*** reason=\\\\\"GROK_OAUTH_REQUEST_FAILED\\\\\"\"}");
+    // 确保该行确实解析失败
+    let rawFails = false;
+    try { JSON.parse(badLine); } catch { rawFails = true; }
+    assert(rawFails, "损坏行原始解析应失败");
+    const r = await worker.fetch(
+      new Request("https://x/admin/accounts/import", { method: "POST", headers: H, body: badLine + "\n" }),
+      env, ctx
+    );
+    eq(r.status, 200, "status 200");
+    const j = await r.json();
+    eq(j.created, 1, "修复后 created=1");
+    eq(j.failed, 0, "无失败");
+    const row = await db.prepare("SELECT name, platform FROM accounts_v2 WHERE name=?").bind("B #2").first();
+    eq(row.platform, "grok", "grok 账号落库");
+  });
+
+  await test("POST /admin/accounts/import 支持 ISO 日期字符串 expires_at（原版 grok 导出）", async () => {
+    const { db, env, ctx } = setup();
+    const H = { "x-admin-token": "test-admin-token", "content-type": "application/json" };
+    const payload = [{
+      id: 26, name: "B #2", platform: "grok", type: "oauth",
+      credentials: { access_token: "sk-grok", refresh_token: "rt-grok", expires_at: "2026-08-01T20:46:05Z" },
+    }];
+    const r = await worker.fetch(
+      new Request("https://x/admin/accounts/import", { method: "POST", headers: H, body: JSON.stringify(payload) }),
+      env, ctx
+    );
+    eq(r.status, 200, "status 200");
+    const j = await r.json();
+    eq(j.created, 1, "created=1");
+    const row = await db.prepare("SELECT platform, expires_at FROM accounts_v2 WHERE name=?").bind("B #2").first();
+    eq(row.platform, "grok", "platform grok");
+    assert(row.expires_at > 1700000000000, "ISO 日期字符串转毫秒成功");
+  });
+
+  await test("POST /admin/accounts/import 同名不同 token 账号各自独立（原版允许重名）", async () => {
+    const { db, env, ctx } = setup();
+    const H = { "x-admin-token": "test-admin-token", "content-type": "application/json" };
+    const two = [
+      { id: 70, name: "B", platform: "antigravity", type: "oauth", credentials: { email: "a@x.com", access_token: "ya29.aaa", refresh_token: "1//aaa" } },
+      { id: 74, name: "B", platform: "antigravity", type: "oauth", credentials: { email: "b@x.com", access_token: "ya29.bbb", refresh_token: "1//bbb" } },
+    ];
+    const r1 = await worker.fetch(new Request("https://x/admin/accounts/import", { method: "POST", headers: H, body: JSON.stringify(two) }), env, ctx);
+    const j1 = await r1.json();
+    eq(j1.created, 2, "首次导入同名不同 token 都创建");
+    // 重复导入：应全部更新，不产生新行
+    const r2 = await worker.fetch(new Request("https://x/admin/accounts/import", { method: "POST", headers: H, body: JSON.stringify(two) }), env, ctx);
+    const j2 = await r2.json();
+    eq(j2.created, 0, "重导不新建");
+    eq(j2.updated, 2, "重导全部更新");
+    const n = (await db.prepare("SELECT COUNT(*) AS n FROM accounts_v2 WHERE platform='antigravity' AND name='B'").first()).n;
+    eq(n, 2, "库里保持两条同名账号");
+  });
+
+  await test("POST /admin/accounts/import 支持 antigravity 平台（OAuth）", async () => {
+    const { db, env, ctx } = setup();
+    const H = { "x-admin-token": "test-admin-token", "content-type": "application/json" };
+    const payload = [{
+      id: 70, name: "B", platform: "antigravity", type: "oauth", concurrency: 10,
+      credentials: { email: "test@example.com", access_token: "ya29.abc", refresh_token: "1//xyz", expires_at: 1786343035 },
+    }];
+    const r = await worker.fetch(
+      new Request("https://x/admin/accounts/import", { method: "POST", headers: H, body: JSON.stringify(payload) }),
+      env, ctx
+    );
+    eq(r.status, 200, "status 200");
+    const j = await r.json();
+    eq(j.created, 1, "created=1");
+    const row = await db.prepare("SELECT platform, type, concurrency FROM accounts_v2 WHERE name=? AND platform=?").bind("B", "antigravity").first();
+    eq(row.platform, "antigravity", "platform antigravity");
+    eq(row.type, "oauth", "type oauth");
+    eq(row.concurrency, 10, "concurrency 保留");
   });
 
   await test("POST /admin/accounts/import/codex-session 子路径（与原版前端一致）", async () => {
@@ -1508,8 +1806,7 @@ async function parityTests(mock) {
     assert(list[0].last_checked_at, "有检测时间");
     eq(list[0].last_check_result, "ok", "mock 上游可达 -> ok");
     assert(typeof list[0].latency_ms === "number", "带延迟 ms");
-    // 探测失败：记录结构化错误 + 错误原因摘要（10 分钟内不会重复探测，先清掉检查时间强制重测）
-    await db.prepare("UPDATE accounts_v2 SET last_checked_at=NULL WHERE name='ch-acc'").run();
+    // 探测失败：记录结构化错误 + 错误原因摘要（一键检测为强制模式，不受 10 分钟节流限制，直接重测）
     mock.nextStatus = 500;
     await worker.fetch(new Request("https://x/admin/channels/check", { method: "POST", headers: H }), env, ctx);
     await ctx.drain();

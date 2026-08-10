@@ -200,8 +200,8 @@ async function handleChat(request, env, ctx, protocol = "openai", geminiMeta = n
     groupPlatform = g.platform || "";
   }
 
-  // 选账号：Sub2API 风格调度（可带分组平台过滤）
-  const acct = await selectAccount(db, groupPlatform || null);
+  // 选账号：Sub2API 风格调度（可带分组平台过滤 + 模型维度路由）
+  const acct = await selectAccount(db, groupPlatform || null, openaiBody.model);
   if (!acct) return json({ error: "no available upstream account" }, 503);
 
   // 账号级并发限制（进程内计数，上限 = 账号 concurrency）
@@ -214,10 +214,11 @@ async function handleChat(request, env, ctx, protocol = "openai", geminiMeta = n
     db.prepare("UPDATE accounts_v2 SET last_used_at = ? WHERE id = ?").bind(now(), acct.id).run()
   );
 
-  // 同协议直通：anthropic 入站 + anthropic/antigravity 账号，或 gemini 入站 + gemini 账号，
+  // 同协议直通：anthropic 入站 + anthropic 账号，或 gemini 入站 + gemini 账号，
   // 直接透传原生请求（保留 tools/thinking 等语义），只捕获用量。
+  // antigravity 不走直通：它在 relay 层有独立的 v1internal 协议适配（OpenAI 双向转换）。
   const sameProtocol =
-    (protocol === "anthropic" && (acct.platform === "anthropic" || acct.platform === "antigravity")) ||
+    (protocol === "anthropic" && acct.platform === "anthropic") ||
     (protocol === "gemini" && acct.platform === "gemini");
   if (sameProtocol) {
     return await relaySameProtocol(request, env, ctx, acct, body, keyRow, protocol, geminiMeta);
@@ -334,7 +335,7 @@ async function relaySameProtocol(request, env, ctx, acct, rawBody, keyRow, proto
 }
 
 // Sub2API 风格调度：schedulable=1 & status='active' & 无限速/过载/临时封禁窗口
-async function selectAccount(db, platform = null) {
+async function selectAccount(db, platform = null, model = null) {
   const t = now();
   const where = [
     "schedulable = 1 AND status = 'active'",
@@ -347,10 +348,18 @@ async function selectAccount(db, platform = null) {
     where.push("platform = ?");
     vals.push(platform);
   }
-  return db
-    .prepare(`SELECT * FROM accounts_v2 WHERE ${where.join(" AND ")} ORDER BY priority ASC, last_used_at ASC LIMIT 1`)
-    .bind(...vals)
-    .first();
+  const base = `SELECT * FROM accounts_v2 WHERE ${where.join(" AND ")}`;
+  // 模型维度路由：优先选 model_map 里声明了该模型的账号（account 的可用模型列表）；
+  // 无 model_map / 空映射的账号视为“全能兜底”，仅在没有任何账号声明该模型时参与。
+  if (model) {
+    const esc = String(model).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    const acct = await db
+      .prepare(`${base} AND (json_extract(model_map, '$."${esc}"') IS NOT NULL OR model_map IS NULL OR TRIM(COALESCE(model_map, '')) IN ('', '{}')) ORDER BY priority ASC, last_used_at ASC LIMIT 1`)
+      .bind(...vals)
+      .first();
+    if (acct) return acct;
+  }
+  return db.prepare(`${base} ORDER BY priority ASC, last_used_at ASC LIMIT 1`).bind(...vals).first();
 }
 
 // ---------- 进程内限流 / 并发信号量 ----------
@@ -622,13 +631,13 @@ async function expireDue(env) {
 
 // 渠道健康监控：定时对每个 active 账号做一次轻量探测（模型列表请求），更新状态与检查时间。
 // 探测失败会标记账号 error；成功则恢复 active（清除错误）。
-async function monitorChannels(env) {
+async function monitorChannels(env, force = false) {
   const db = env.DB;
   const t = now();
-  const rows = await db
-    .prepare("SELECT * FROM accounts_v2 WHERE status != 'disabled' AND (last_checked_at IS NULL OR last_checked_at < ?)")
-    .bind(t - 10 * 60 * 1000)
-    .all();
+  // force=true（一键全通道检测）：无视 10 分钟节流，立即探测全部账号
+  const rows = force
+    ? await db.prepare("SELECT * FROM accounts_v2 WHERE status != 'disabled'").all()
+    : await db.prepare("SELECT * FROM accounts_v2 WHERE status != 'disabled' AND (last_checked_at IS NULL OR last_checked_at < ?)").bind(t - 10 * 60 * 1000).all();
   for (const acct of rows.results || []) {
     try {
       const res = await probeAccount(acct);
@@ -648,9 +657,25 @@ async function probeAccount(acct) {
   const base = (acct.base_url && acct.base_url.trim()) || DEFAULT_BASE[acct.platform];
   const headers = { "content-type": "application/json" };
   let url = "";
-  if (acct.platform === "anthropic" || acct.platform === "antigravity") {
+  if (acct.platform === "anthropic") {
     url = `${base}/v1/models`;
     headers["x-api-key"] = cred.api_key || cred.access_token || "";
+  } else if (acct.platform === "antigravity") {
+    // 真实 Antigravity：fetchAvailableModels 需要 project_id + Google Bearer token
+    const rawCred = safeJson(acct.credentials, {});
+    url = `${base}/v1internal:fetchAvailableModels`;
+    headers.authorization = "Bearer " + (cred.access_token || cred.api_key || "");
+    const body = JSON.stringify({ project: rawCred.project_id || "" });
+    const t0 = now();
+    try {
+      const r = await fetch(url, { method: "POST", headers, body, signal: AbortSignal.timeout(8000) });
+      const latency = now() - t0;
+      if (r.ok || r.status === 403) return { ok: true, latency_ms: latency, error: null };
+      const txt = await r.text().catch(() => "");
+      return { ok: false, latency_ms: latency, error: `HTTP ${r.status} ${txt.slice(0, 120)}` };
+    } catch (e) {
+      return { ok: false, latency_ms: now() - t0, error: String(e).slice(0, 200) };
+    }
   } else if (acct.platform === "gemini") {
     url = `${base}/v1beta/models?key=${encodeURIComponent(cred.api_key || "")}`;
   } else {
@@ -722,6 +747,13 @@ const OAUTH_PROVIDERS = {
     scope: "openid email offline_access",
     clientIdEnv: "GROK_OAUTH_CLIENT_ID",
     clientSecretEnv: "GROK_OAUTH_CLIENT_SECRET",
+  },
+  antigravity: {
+    authorizeUrl: "https://accounts.google.com/o/oauth2/v2/auth",
+    tokenUrl: "https://oauth2.googleapis.com/token",
+    scope: "https://www.googleapis.com/auth/generative-language",
+    clientIdEnv: "ANTIGRAVITY_OAUTH_CLIENT_ID",
+    clientSecretEnv: "ANTIGRAVITY_OAUTH_CLIENT_SECRET",
   },
 };
 
@@ -809,15 +841,14 @@ async function handleAdmin(request, env, url) {
     }
     // POST /admin/accounts/data —— Sub2API 前端数据导入（{data: payload} 包装）
     if (request.method === "POST" && sub === "data") {
-      let b = await request.json().catch(() => ({}));
-      if (b && b.data && typeof b.data === "object") b = b.data; // 解开 {data, skip_default_group_bind}
-      const result = await importAccounts(db, b);
+      const entries = await parseImportBody(request);
+      const result = await importAccounts(db, entries);
       return json(result, result.failed > 0 && result.created === 0 ? 207 : 200);
     }
-    // 批量导入：数组 / Codex 风格 / codex-session 子路径（与原版前端一致）
+    // 批量导入：数组 / Codex 风格 / NDJSON 单行（与原版前端一致）
     if (request.method === "POST" && sub === "import") {
-      const b = await request.json().catch(() => ({}));
-      const result = await importAccounts(db, b);
+      const entries = await parseImportBody(request);
+      const result = await importAccounts(db, entries);
       return json(result, result.failed > 0 && result.created === 0 ? 207 : 200);
     }
     // GET /admin/accounts —— 列表
@@ -1392,7 +1423,8 @@ async function handleAdmin(request, env, url) {
       return json(rows.results);
     }
     if (request.method === "POST" && sub === "check") {
-      await monitorChannels(env);
+      // 一键全通道检测：强制重新探测所有账号（不受 10 分钟节流限制）
+      await monitorChannels(env, true);
       return json({ ok: true });
     }
     return json({ error: "bad channels request" }, 400);
@@ -1538,6 +1570,24 @@ const TYPE_ALIASES = {
   cookie: "cookie",
 };
 
+function decodeAndEnrichIDToken(platform, credentials) {
+  if (platform !== "openai" || !credentials || !credentials.id_token) return credentials;
+  try {
+    const parts = credentials.id_token.split(".");
+    if (parts.length !== 3) return credentials;
+    const payload = JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")));
+    const ctx = payload["https://api.openai.com/auth"] || {};
+    const profile = payload["https://api.openai.com/profile"] || {};
+    if (profile.email && !credentials.email) credentials.email = profile.email;
+    if (ctx.chatgpt_plan_type && !credentials.plan_type) credentials.plan_type = ctx.chatgpt_plan_type;
+    if (ctx.chatgpt_account_id && !credentials.chatgpt_account_id) credentials.chatgpt_account_id = ctx.chatgpt_account_id;
+    if (ctx.chatgpt_user_id && !credentials.chatgpt_user_id) credentials.chatgpt_user_id = ctx.chatgpt_user_id;
+    if (ctx.organization_id && !credentials.organization_id) credentials.organization_id = ctx.organization_id;
+    if (ctx.user_id && !credentials.openai_user_id) credentials.openai_user_id = ctx.user_id;
+  } catch {}
+  return credentials;
+}
+
 function normalizeAccountInput(b) {
   // Sub2API 备份导出用 provider 字段，简化数组用 platform 字段，两者都接受
   const platform = PLATFORM_ALIASES[((b.platform || b.provider) || "").toLowerCase()];
@@ -1556,13 +1606,27 @@ function normalizeAccountInput(b) {
   if (type === "api_key" && !credentials.api_key) return { error: "api_key required" };
   if (type === "oauth" && !credentials.access_token && !credentials.refresh_token) return { error: "oauth requires access_token or refresh_token" };
 
-  // 统一 expires_at 为毫秒：Sub2API 导出用 unix 秒，本系统内部用毫秒
+  // 解码 OpenAI OAuth id_token 丰富字段
+  decodeAndEnrichIDToken(platform, credentials);
+
+  // 统一 expires_at 为毫秒：Sub2API 导出用 unix 秒，ISO 字符串也兼容
   let expires_at = b.expires_at ?? credentials.expires_at ?? null;
   if (expires_at != null) {
-    expires_at = Number(expires_at);
-    if (!Number.isNaN(expires_at) && expires_at < 1e12) expires_at = expires_at * 1000; // 秒 -> 毫秒
-    // 同步回 credentials，保证刷新逻辑读取一致
+    if (typeof expires_at === "string" && expires_at.includes("T") && expires_at.includes("Z")) {
+      // ISO 8601 日期字符串 -> 毫秒
+      expires_at = new Date(expires_at).getTime();
+      if (Number.isNaN(expires_at)) expires_at = null;
+    } else {
+      expires_at = Number(expires_at);
+      if (!Number.isNaN(expires_at) && expires_at < 1e12) expires_at = expires_at * 1000; // 秒 -> 毫秒
+    }
     if (credentials.expires_at != null) credentials.expires_at = expires_at;
+  }
+
+  // model_mapping 可能放在 credentials 内（原版导出格式）或顶层本版 model_map
+  let model_map = b.model_map || {};
+  if (Object.keys(model_map).length === 0 && credentials.model_mapping && typeof credentials.model_mapping === "object") {
+    model_map = credentials.model_mapping;
   }
 
   // notes 存入 extra，便于回看
@@ -1575,8 +1639,8 @@ function normalizeAccountInput(b) {
     platform, type,
     credentials,
     extra,
-    base_url: (b.base_url && b.base_url.trim()) || DEFAULT_BASE[platform] || null,
-    model_map: b.model_map || {},
+    base_url: (b.base_url && b.base_url.trim()) || (credentials.base_url || "").trim() || DEFAULT_BASE[platform] || null,
+    model_map,
     priority: b.priority ?? 50,
     concurrency: b.concurrency ?? 3,
     expires_at,
@@ -1602,15 +1666,85 @@ async function createAccount(db, norm) {
   return { id: row.id };
 }
 
+// 解析导入请求体：支持 JSON 对象 / 数组 / NDJSON（JSONL）
+async function parseImportBody(request) {
+  let raw = "";
+  try {
+    raw = await request.text();
+  } catch { return {}; }
+  if (!raw.trim()) return {};
+  // 先尝试标准 JSON 解析
+  try {
+    const parsed = JSON.parse(raw);
+    // 如果是 {data: ...} 包装，解一层
+    if (parsed && parsed.data && typeof parsed.data === "object" && !Array.isArray(parsed) && !parsed.platform && !parsed.accounts) {
+      return parsed.data;
+    }
+    return parsed;
+  } catch {}
+  // JSON 解析失败 -> 尝试 NDJSON（每行一个 JSON 对象）
+  const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(l => l && l.startsWith("{"));
+  const entries = [];
+  const parseErrors = [];
+  for (let i = 0; i < lines.length; i++) {
+    const obj = tryParseLine(lines[i]);
+    if (obj.error) {
+      parseErrors.push({ index: i, message: obj.error });
+    } else {
+      entries.push(obj.value);
+    }
+  }
+  if (entries.length === 0 && lines.length > 0) {
+    // 所有行都解析失败：作为元错误信息返回
+    return { __parseErrors: parseErrors, __rawSnippet: raw.slice(0, 500) };
+  }
+  // 如果只有一行，返回单对象（格式 C 兼容）；多行返回数组
+  return entries.length === 1 ? entries[0] : entries;
+}
+
+// 单行 JSON 解析，带损坏修复：原版 Go 导出把错误信息里的引号双重转义成 \"（文件里是 \\"），
+// 导致该行不是合法 JSON。修复规则：把 \\" 替换为 \"（仅影响错误/原因文本，不影响 JWT/access_token）。
+function tryParseLine(line) {
+  try {
+    return { value: JSON.parse(line) };
+  } catch (e) {
+    const msg = String(e.message).slice(0, 100);
+    if (line.includes('\\"')) {
+      try {
+        return { value: JSON.parse(line.replace(/\\\\"/g, '\\"')) };
+      } catch {}
+    }
+    return { error: msg };
+  }
+}
+
 // ---------- 双格式导入 ----------
 
 async function importAccounts(db, body) {
   let entries = [];
 
+  // NDJSON 全部解析失败时的回退
+  if (body && body.__parseErrors && Array.isArray(body.__parseErrors)) {
+    return {
+      total: 0, created: 0, updated: 0, skipped: 0, failed: body.__parseErrors.length,
+      items: [], warnings: [], errors: body.__parseErrors.map((e, i) => ({ message: "第 " + (i + 1) + " 行 JSON 解析失败：" + e.message })),
+      account_created: 0, account_failed: body.__parseErrors.length,
+      proxy_created: 0, proxy_reused: 0, proxy_failed: 0, proxy_skipped: 0,
+    };
+  }
+
   // 格式D：Sub2API 备份导出 { version, exported_at, accounts:[...] }
   if (body && Array.isArray(body.accounts)) {
     for (let i = 0; i < body.accounts.length; i++) {
       const norm = normalizeAccountInput(body.accounts[i]);
+      if (norm.error) entries.push({ index: i, action: "failed", message: norm.error });
+      else entries.push({ index: i, action: "import", account: norm });
+    }
+  }
+  // NDJSON 解析为数组时，每行单独规范化
+  else if (Array.isArray(body) && body.length > 0 && typeof body[0] === "object" && body[0].id != null) {
+    for (let i = 0; i < body.length; i++) {
+      const norm = normalizeAccountInput(body[i]);
       if (norm.error) entries.push({ index: i, action: "failed", message: norm.error });
       else entries.push({ index: i, action: "import", account: norm });
     }
@@ -1686,10 +1820,11 @@ async function importAccounts(db, body) {
     if (seen.has(fp)) { result.skipped++; result.items.push({ index: e.index, action: "skipped", name: acc.name }); continue; }
     seen.add(fp);
 
-    // 已存在同名同平台 -> 更新
-    const exist = await db
-      .prepare("SELECT id FROM accounts_v2 WHERE platform=? AND type=? AND name=? LIMIT 1")
-      .bind(acc.platform, acc.type, acc.name).first();
+    // 已存在同名同平台：token 相同视为同一账号 -> 更新（幂等重导）；token 不同则作为独立账号新建（原版允许重名账号，如两个 antigravity 的 "B"）
+    const sameName = await db
+      .prepare("SELECT id, credentials FROM accounts_v2 WHERE platform=? AND type=? AND name=?")
+      .bind(acc.platform, acc.type, acc.name).all();
+    const exist = (sameName.results || []).find((r) => sameCredential(acc.credentials, r.credentials));
     if (exist) {
       await db
         .prepare(`UPDATE accounts_v2 SET credentials=?, extra=?, model_map=?, base_url=?, priority=?, concurrency=?, expires_at=?, status='active', error_message=NULL WHERE id=?`)
@@ -1720,6 +1855,48 @@ async function importAccounts(db, body) {
     await restoreFullBackup(db, body, result);
   }
   return result;
+}
+
+// 导入后静默刷新可用模型（非阻塞，仅对已知平台尝试）
+async function refreshAccountModels(db, accountId, platform, credentials, baseUrl) {
+  if (!accountId || !platform) return;
+  try {
+    let url = "";
+    let headers = {};
+    if (platform === "openai") {
+      url = (baseUrl || "https://api.openai.com/v1") + "/models";
+      const ak = credentials?.access_token || credentials?.api_key || "";
+      if (ak) headers["authorization"] = "Bearer " + ak;
+      else return;
+    } else if (platform === "anthropic" || platform === "antigravity") {
+      return; // 这些平台不需要模型列表刷新
+    } else if (platform === "gemini") {
+      return; // Gemini 模型由平台固定
+    } else if (platform === "grok") {
+      url = (baseUrl || "https://api.x.ai") + "/v1/models";
+      const ak = credentials?.access_token || "";
+      if (ak) headers["authorization"] = "Bearer " + ak;
+      else return;
+    } else {
+      return;
+    }
+    const resp = await fetch(url, { headers, signal: AbortSignal.timeout(8000) });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const modelIds = ((data.data || data.models || []) || []).map(m => m.id || m.name?.replace("models/", "") || "").filter(Boolean);
+    if (modelIds.length === 0) return;
+    const existing = await db.prepare("SELECT model_map FROM accounts_v2 WHERE id=?").bind(accountId).first();
+    if (!existing) return;
+    let map = {};
+    try { map = JSON.parse(existing.model_map); } catch {}
+    let changed = false;
+    for (const id of modelIds) {
+      if (!map[id]) { map[id] = id; changed = true; }
+    }
+    if (changed) {
+      await db.prepare("UPDATE accounts_v2 SET model_map=? WHERE id=?").bind(JSON.stringify(map), accountId).run();
+    }
+  } catch {}
 }
 
 // 还原完整备份的扩展段。按名称/标识解析跨表关系（username/group name/package name/key 值），
@@ -1952,4 +2129,18 @@ function fingerprint(acc) {
   const c = acc.credentials || {};
   const key = c.api_key || c.access_token || c.refresh_token || JSON.stringify(c);
   return `${acc.platform}|${acc.type}|${acc.name}|${key}`;
+}
+
+// 判断导入凭证与库内账号是否为同一账号：任一核心 token（api_key/access_token/refresh_token）相同即视为同一
+function sameCredential(newCred, storedCredJson) {
+  try {
+    const old = typeof storedCredJson === "string" ? JSON.parse(storedCredJson) : (storedCredJson || {});
+    const keys = ["api_key", "access_token", "refresh_token"];
+    for (const k of keys) {
+      if (newCred?.[k] && old[k] && newCred[k] === old[k]) return true;
+    }
+    // 都没有可比 token：退化为按名称更新（旧行为）
+    if (!newCred?.api_key && !newCred?.access_token && !newCred?.refresh_token) return true;
+  } catch {}
+  return false;
 }

@@ -7,7 +7,7 @@
 
 - 支持 **5 个平台**：`openai` / `anthropic`(Claude) / `gemini` / `grok`(xAI) / `antigravity`
 - 支持 **api_key** 与 **oauth** 两种凭证类型（**cookie/sessionKey 类型明确不支持**，规避平台限制风险）
-- **Sub2API 风格批量导入**：简化数组 / Codex 风格 `content` / 原版备份导出 `sub2api-data` 三格式
+- **Sub2API 风格批量导入**：简化数组 / Codex 风格 `content` / 原版备份导出 `sub2api-data` / NDJSON 四格式
 - **多账号调度**：priority + schedulable + 限速/过载时间窗（对齐 Sub2API 调度策略）
 - **OAuth 自动刷新**：Cron 每 10 分钟刷新临近过期的 token
 - **管理模型**：用户 / 分组 / 套餐订阅 / 兑换码 / 公告 / 审计日志 / 站点设置 / 渠道监控 / 模型广场 / 模型限流（对齐原版后台页面）
@@ -145,7 +145,7 @@ curl -X POST https://<你的地址>/admin/accounts/import \
 浏览器访问 `https://<你的地址>/admin?token=<ADMIN_TOKEN>`，或直接打开 `/admin` 后在页面里粘贴令牌。侧边栏共 16 个页面：
 
 - **概览**：累计 tokens / 调用次数 / 活跃用户 / Key / 账号 / 订阅统计 + **健康度卡片**（各平台账号可用/异常数、最近渠道探测结果含**延迟 ms** 与失败原因、Key 配额使用率进度条）
-- **上游账号**：列表 + 手动添加 + 批量导入（三格式）+ 开关 / 改名 / 清错 / 删除 / 单账号用量
+- **上游账号**：列表 + 手动添加 + 批量导入（四格式，含 NDJSON `.txt`）+ 开关 / 改名 / 清错 / 删除 / 单账号用量
 - **API Keys**：生成 / 启停 / 额度调整 / 归属用户分组
 - **用量记录**：逐条流水，带 Key 标签 / 账号名 / 模型 / token 数
 - **用户 / 分组 / 套餐 / 订阅 / 兑换码**：原版管理模型，均可增删改；用户行点 **📊** 打开用量图表（按天 / 按模型 / 按账号的 token 与调用次数柱状图，纯 CSS 无外部依赖）
@@ -203,7 +203,11 @@ curl https://<你的地址>/v1beta/models/gemini-2.5-flash:generateContent \
 后台"概览"显示累计 tokens、调用次数、可用 Key / 账号数；客户端也能用 `GET /v1/usage` 查询自己的用量。
 
 ### 4. 与原版互导备份（数据管理）
-后台"批量导入"支持**原版 Sub2API 的备份导出**（`type: "sub2api-data"`，含 `accounts` 数组），可以从原版后台"数据导出"得到的 JSON 直接粘贴/上传导入，字段（`apikey`/`setup-token` 等类型名、unix 秒 `expires_at`、`notes`）都会自动归一。备份里的 `proxies` 会被跳过（Cloudflare 版无代理绑定），导入结果同时返回原版兼容的 `account_created` / `account_failed` / `proxy_*` 字段。
+后台"批量导入"支持**原版 Sub2API 的备份导出**（`type: "sub2api-data"`，含 `accounts` 数组），可以从原版后台"数据导出"得到的 JSON 直接粘贴/上传导入；也支持 **NDJSON/JSONL**（原版"账号列表"导出的 `.txt`，每行一个 JSON 对象，含 `id`/`name`/`platform`/`credentials`/`extra` 等原始字段）——直接上传原文件即可整批导入。字段自动归一：`apikey`/`setup-token` 等类型名、unix 秒或 ISO 字符串 `expires_at`（`2026-08-01T20:46:05Z`）、`notes`、`model_mapping`（自动提取为可用模型）、OpenAI `id_token`（自动解码补全 email/plan_type/chatgpt 账号 ID，与原版 `enrichCredentialsFromIDToken` 对齐）。备份里的 `proxies` 会被跳过（Cloudflare 版无代理绑定），导入结果同时返回原版兼容的 `account_created` / `account_failed` / `proxy_*` 字段。
+
+**兼容原版导出里的损坏行**：原版 Go 导出会把错误信息里的引号双重转义成 `\\"`（文件里为 `\\\\"`），导致整行不是合法 JSON（典型：`temp_unschedulable_reason` 含 `GROK_OAUTH_REQUEST_FAILED` 的账号行）。导入器会自动修复（`\\\\"` → `\\"`，仅影响错误文本，不影响 JWT/token），坏行不再导致整批失败。
+
+**同名账号按 token 区分**：原版允许重名账号（如两个 antigravity 的 `B`，不同邮箱/token）。本版导入时：同名同平台账号若 token（access_token/refresh_token）相同则视为同一账号做更新（幂等重导）；token 不同则作为独立账号新建，与你的原始数据保持一致。
 
 **导出是原版格式的兼容超集**：头部 `type/version/exported_at/proxies/accounts` 与原版完全一致（`version: 1`），因此本版导出的备份可以直接导入回**原版**（原版忽略未知字段，只取账号部分）；同时额外携带完整扩展段，可在本版实例间**整体迁移**：
 
@@ -220,7 +224,7 @@ curl https://<你的地址>/v1beta/models/gemini-2.5-flash:generateContent \
 
 对应管理 API（均需 `x-admin-token`）：
 
-- `POST /admin/accounts/import` —— 多格式批量导入（数组 / Codex 风格 / 备份导出）
+- `POST /admin/accounts/import` —— 多格式批量导入（数组 / Codex 风格 / 备份导出 / NDJSON）
 - `POST /admin/accounts/import/codex-session` —— 与原版前端同路径的 Codex 会话导入
 - `POST /admin/accounts/data` —— 原版"数据导入"路径（`{data: payload}` 包装）
 - `GET /admin/accounts/data` —— 导出 `sub2api-data` 兼容超集备份（账号段可反向导入原版，扩展段在本版间迁移）
@@ -235,9 +239,13 @@ curl https://<你的地址>/v1beta/models/gemini-2.5-flash:generateContent \
 | `anthropic` | `https://api.anthropic.com` | Anthropic Messages | api_key / oauth |
 | `gemini` | `https://generativelanguage.googleapis.com` | Gemini v1beta | api_key / oauth |
 | `grok` | `https://api.x.ai/v1` | OpenAI 兼容 | api_key / oauth |
-| `antigravity` | `https://api.anthropic.com` | Anthropic Messages | api_key / oauth |
+| `antigravity` | `https://cloudcode-pa.googleapis.com` | Antigravity v1internal（真实 Google API） | oauth（project_id + Google token） |
 
 模型别名：在账号的 `model_map` 写 `{"对外名":"上游真实名"}`，例如 `claude-3-5-sonnet` → `claude-3-5-sonnet-20241022`。
+
+**模型维度路由**：选账号时优先选 `model_map` 里声明了该模型的账号（每个账号只服务自己可用模型列表中的模型），`model_map` 为空/未配置的账号作为全能兜底；同优先级下 `priority` 小的先选。所以多平台混合使用时，`gpt-4o` 自动走 openai 账号、`grok-3` 走 grok 账号、`claude-*` 走 anthropic/antigravity 账号，互不抢单。
+
+Antigravity 说明：账号 `credentials` 需含 `project_id`（Google Cloud 项目 ID）+ `access_token`（Google OAuth）。入站 `/v1/chat/completions`（OpenAI）与 `/v1/messages`（Anthropic）双协议自动翻译为 Antigravity `v1internal:generateContent` / `:streamGenerateContent?alt=sse`；模型名走 `model_map` 或内置别名（`claude-opus-4-6` → `claude-opus-4-6-thinking` 等）。
 
 ---
 
@@ -245,7 +253,7 @@ curl https://<你的地址>/v1beta/models/gemini-2.5-flash:generateContent \
 
 - 调度选中 oauth 账号时，若 `expires_at` 距现在 < 5 分钟，自动用 `refresh_token` 换取新 `access_token` 并写回 D1。
 - Cron Trigger `*/10 * * * *` 会批量刷新所有临近过期的 oauth 账号。
-- 刷新端点：`openai`→`auth.openai.com/oauth/token`，`gemini`→`oauth2.googleapis.com/token`，`grok`→`auth.x.ai/oauth2/token`。
+- 刷新端点：`openai`→`auth.openai.com/oauth/token`，`gemini`→`oauth2.googleapis.com/token`，`grok`→`auth.x.ai/oauth2/token`，`antigravity`→`oauth2.googleapis.com/token`（antigravity 无 `client_id` 时用内置官方客户端，可用 `ANTIGRAVITY_CLIENT_ID/SECRET` 覆盖）。
 
 ---
 
@@ -259,6 +267,18 @@ npm test
 覆盖 relay 协议适配（OpenAI/Anthropic/Gemini/**Responses**）、导入（三格式/去重/cookie拒绝）、Sub2API 调度（priority/限速窗）、OAuth 刷新、Grok 平台、管理后台 API（账号/Key 增删改、用量流水）、用户/分组/套餐/兑换码/公告/设置/审计、用户用量图表汇总、网关用户门控与 RPM 限流、**模型维度限流**、**完整备份导出/跨实例回导**、**概览健康度 + 渠道探测延迟/失败原因**等 **336 项断言**，任一失败会非零退出。
 
 ## 本地预览管理后台（模拟服务）
+
+**账号连通性测试**（自动化）：`npm run test:accounts` 或直接 `bash test/check-accounts.sh`，验证部署后 `https://你的域名/v1 + key` 能访问模型——步骤：① `GET /v1/models`（key 可列出模型）② 逐账号取 model_map 里一个模型非流式调用 ③ 同模型流式调用。模型维度路由会自动把请求打到声明该模型的账号，无需逐个禁用。
+
+```bash
+BASE=https://你的域名 ADMIN_TOKEN=你的令牌 bash test/check-accounts.sh
+# 只测某平台：ONLY_PLATFORM=openai bash test/check-accounts.sh
+# 本地：BASE=http://127.0.0.1:8788 ADMIN_TOKEN=dev-admin-token bash test/check-accounts.sh
+```
+
+**后台一键全通道检测**：渠道监控页「⚡ 一键全通道检测」按钮强制重新探测全部账号（不受 10 分钟节流限制），顶部生成「✓ 通过 X · ✗ 失败 Y」报告，每个失败账号给出可执行的恢复建议（凭证无效/上游不可达/限流/403 封锁/OAuth 过期等）。
+
+注意需在能访问公网的环境运行（本机或已部署的 Worker）；部分数据中心 IP 会被 Anthropic 拒（403 Request not allowed），属网络侧限制而非账号问题。
 
 不依赖 wrangler/Cloudflare，直接在浏览器里跑真实 worker + 内存 D1（node:sqlite），可完整操作后台（账号/Key/用量的增删改、批量导入）：
 

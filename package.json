@@ -8,7 +8,8 @@
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
     "test": "node --experimental-sqlite test/run.js",
-    "test:loop": "node test/loop.mjs"
+    "test:loop": "node test/loop.mjs",
+    "test:accounts": "bash test/check-accounts.sh"
   },
   "devDependencies": {
     "wrangler": "^3.0.0"

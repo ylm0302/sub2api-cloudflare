@@ -555,7 +555,7 @@ function saveAccount(id){
 
 /* ---------- OAuth 登录导入（替换原版 OAuth 登录 UI） ---------- */
 function openOAuthModal(){
-  var provs=["openai","anthropic","gemini","grok"];
+  var provs=["openai","anthropic","gemini","grok","antigravity"];
   var btns="";
   provs.forEach(function(p){
     btns+='<button class="btn" style="margin-right:8px;margin-bottom:8px" onclick="oauthLogin(&#39;'+p+'&#39;)">'+esc(p)+" 登录</button>";
@@ -574,9 +574,9 @@ function oauthLogin(provider){
 /* ---------- 批量导入 ---------- */
 function openImportModal(){
   var nl="&#10;";
-  var ph="[ "+nl+'  {"name":"acc1","platform":"openai","type":"api_key","credentials":{"api_key":"sk-xxx"}}'+nl+"]"+nl+nl+'或 {"content":"eyJ...","name":"batch","platform":"openai"}'+nl+nl+'或 {"type":"sub2api-data","version":1,"proxies":[],"accounts":[...],"users":[...],"user_keys":[...],"subscriptions":[...]}';
+  var ph="[ "+nl+'  {"name":"acc1","platform":"openai","type":"api_key","credentials":{"api_key":"sk-xxx"}}'+nl+"]"+nl+nl+'或 {"content":"eyJ...","name":"batch","platform":"openai"}'+nl+nl+'或 {"type":"sub2api-data","version":1,"proxies":[],"accounts":[...]}'+nl+nl+'或 NDJSON（每行一个 JSON 对象，原版账号列表导出 .txt）';
   var m=openModal("批量导入账号（Sub2API 格式）",
-    '<div class="m-sub">支持三种格式：简化数组、Codex 风格 content、sub2api-data 备份导出（proxies 自动跳过；完整备份含用户/Key/订阅/公告/设置/限流规则，可整体迁移）。</div>'+
+    '<div class="m-sub">支持四种格式：简化数组、Codex 风格 content、sub2api-data 备份导出、NDJSON（原版账号列表导出 .txt，每行一个 JSON 对象，自动跳过坏行）。</div>'+
     '<label>平台（Codex 风格 content 导入用）</label><select id="im_platform">'+platformOptions("openai")+"</select>"+
     '<label>导入内容（JSON）</label><textarea id="im_payload" style="height:210px" placeholder="'+ph+'"></textarea>'+
     '<div style="display:flex;align-items:center;gap:10px;margin-top:10px"><label style="margin:0">或上传 JSON 文件</label><input id="im_file" type="file" accept=".json,application/json" style="width:auto"></div>'+
@@ -595,7 +595,17 @@ function doImport(){
 }
 function submitImport(raw){
   var payload;
-  try{payload=JSON.parse(raw);}catch(e){toast("JSON 解析失败："+e.message,"err");return;}
+  try{payload=JSON.parse(raw);}
+  catch(e){
+    // JSON 整体解析失败 -> 尝试 NDJSON（每行一个 JSON 对象，原版账号列表导出 .txt）
+    var lines=raw.split(String.fromCharCode(10)).map(function(l){return l.trim();}).filter(function(l){return l&&l.charAt(0)==="{";});
+    var arr=[],bad=0;
+    for(var i=0;i<lines.length;i++){
+      try{arr.push(JSON.parse(lines[i]));}catch(e2){bad++;}
+    }
+    if(arr.length===0){toast("JSON 解析失败："+e.message,"err");return;}
+    payload=arr;
+  }
   if(payload&&!Array.isArray(payload)&&typeof payload==="object"&&!payload.platform&&payload.content){
     payload.platform=$("im_platform").value;
   }
@@ -1434,19 +1444,51 @@ function loadChannels(){
   c.innerHTML='<div class="sub">加载中…</div>';
   api("/admin/channels").then(function(list){state.channels=list;renderChannels();}).catch(function(e){loadError(c,e);});
 }
+// 根据探测错误给出可执行的恢复建议（供“一键全通道检测”报告展示）
+function channelSuggest(err, acct){
+  var e = (err||"").toLowerCase();
+  if(!e) return "";
+  if(/401|invalid api key|unauthorized|authentication/.test(e)) return "凭证无效：重新 OAuth 登录导入，或更换 API Key";
+  if(/403/.test(e)) return "服务可达但被拒(403)：数据中心 IP 被上游封锁，或账号权限/套餐不足";
+  if(/fetch failed|timeout|timed out|econn|enetunreach|超时|网络/.test(e)) return "上游不可达：域名被墙或网络受限（本机/沙箱常见）；部署到 Cloudflare 后 Worker 出网正常";
+  if(/429|rate limit/.test(e)) return "上游限流(429)：稍等自动恢复";
+  if(/5\d\d/.test(e)) return "上游服务异常("+err+")：稍后重试或检查账号状态";
+  if(/refresh|expired|token/.test(e)) return "OAuth token 刷新/过期：重新授权该账号";
+  return "见错误详情，必要时重新导入该账号";
+}
 function renderChannels(){
+  var list = state.channels||[];
+  var okN = list.filter(function(a){return a.last_check_result==="ok";}).length;
+  var failN = list.filter(function(a){return a.last_check_result==="fail";}).length;
+  var noneN = list.length - okN - failN;
+  var rep = '';
+  if(list.length){
+    rep = '<div class="card" style="margin:0 0 12px"><div style="font-weight:700;margin-bottom:6px">一键全通道检测报告</div>'+
+      '<div>'+
+        (okN?badge("b-active","✓ 通过 "+okN):"")+" "+
+        (failN?badge("b-error","✗ 失败 "+failN):"")+" "+
+        (noneN?badge("b-off","未检测 "+noneN):"")+
+        '<span class="kv" style="margin-left:8px">共 '+list.length+" 个账号 · 失败项见下方建议</span>"+
+      '</div></div>';
+  }
   $("content").innerHTML=
     '<div class="toolbar">'+
-      '<button class="btn primary" onclick="checkChannels()">立即检测</button>'+
+      '<button class="btn primary" onclick="checkChannels()">⚡ 一键全通道检测</button>'+
       '<div class="grow"></div>'+
       '<span class="kv">定时任务每 10 分钟自动探测一次（Workers Cron）</span>'+
     '</div>'+
+    rep+
     '<div class="tbl-wrap"><table><thead><tr>'+
-      "<th>ID</th><th>名称</th><th>平台</th><th>状态</th><th>最近检测</th><th>结果</th><th>错误</th>"+
+      "<th>ID</th><th>名称</th><th>平台</th><th>状态</th><th>最近检测</th><th>结果</th><th>错误 / 恢复建议</th>"+
     '</tr></thead><tbody id="channelTbody"></tbody></table></div>';
   var tb=$("channelTbody");
-  if(!state.channels.length){tb.innerHTML='<tr><td colspan="7" class="empty">还没有账号</td></tr>';return;}
-  state.channels.forEach(function(a){
+  if(!list.length){tb.innerHTML='<tr><td colspan="7" class="empty">还没有账号</td></tr>';return;}
+  list.forEach(function(a){
+    var err = a.error_message||a.probe_error||"";
+    var sug = a.last_check_result==="fail" ? channelSuggest(err, a) : "";
+    var errCell = a.last_check_result==="ok" ? '<span class="kv">-</span>' :
+      '<div class="kv" title="'+esc(err)+'" style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(err||"-")+"</div>"+
+      (sug?'<div class="warn" style="color:#e8a33d;font-size:12px">💡 '+esc(sug)+"</div>":"");
     tb.insertAdjacentHTML("beforeend",
       '<tr>'+
         '<td class="mono">#'+a.id+"</td>"+
@@ -1455,12 +1497,12 @@ function renderChannels(){
         '<td>'+statusBadge(a.status)+"</td>"+
         '<td class="kv">'+fmtTs(a.last_checked_at)+"</td>"+
         '<td>'+(a.last_check_result==="ok"?badge("b-active","✓ 正常"+(a.latency_ms!=null?" · "+a.latency_ms+"ms":"")):(a.last_check_result==="fail"?badge("b-error","✗ 失败"+(a.latency_ms!=null?" · "+a.latency_ms+"ms":"")):badge("b-off","未检测")))+"</td>"+
-        '<td class="kv" title="'+esc(a.error_message||"")+'" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(a.error_message||"-")+"</td>"+
+        '<td>'+errCell+"</td>"+
       "</tr>");
   });
 }
 function checkChannels(){
-  api("/admin/channels/check",{method:"POST"}).then(function(){toast("检测完成","ok");loadChannels();}).catch(function(e){toast(e.message,"err");});
+  api("/admin/channels/check",{method:"POST"}).then(function(){toast("全通道检测完成","ok");loadChannels();}).catch(function(e){toast(e.message,"err");});
 }
 
 /* ---------- 模型广场 ---------- */
