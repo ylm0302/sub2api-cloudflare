@@ -733,7 +733,7 @@ async function probeAccount(acct, env) {
       const latency = now() - t0;
       if (r.ok || r.status === 403) return { ok: true, latency_ms: latency, error: null };
       const txt = await r.text().catch(() => "");
-      return { ok: false, latency_ms: latency, error: `HTTP ${r.status} ${txt.slice(0, 120)}` };
+      return { ok: false, latency_ms: latency, error: `HTTP ${r.status} ${txt.slice(0, 2000)}` };
     } catch (e) {
       return { ok: false, latency_ms: now() - t0, error: String(e).slice(0, 200) };
     }
@@ -867,7 +867,7 @@ async function testAccountConnection(row, env, modelId) {
       }
     } else {
       const txt = await r.text().catch(() => "");
-      result.test_message.error = `HTTP ${r.status} ${txt.slice(0, 400)}`;
+      result.test_message.error = `HTTP ${r.status} ${txt.slice(0, 4000)}`;
       result.error = result.test_message.error;
     }
   } catch (e) {
