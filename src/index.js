@@ -803,11 +803,30 @@ async function testAccountConnection(row, env, modelId) {
     const latency = now() - t0;
     result.test_message = { model_used: testModel, latency_ms: latency, status: r.status };
     if (r.ok) {
-      const j = await r.json().catch(() => ({}));
-      const out = upstream.translateResponse ? upstream.translateResponse(j) : j;
-      const content = ((out.choices || [])[0] || {}).message?.content || "";
-      result.test_message.content = content.slice(0, 200);
-      result.ok = true;
+      const text = await r.text().catch(() => "");
+      // openai OAuth 上游（ChatGPT Codex）返回 SSE，需要从流中提取文本
+      if (upstream.isStream && platform === "openai" && cred.kind === "oauth") {
+        let content = "";
+        for (const line of text.split("\n")) {
+          const t = line.trim();
+          if (!t.startsWith("data:")) continue;
+          const data = t.slice(5).trim();
+          if (data === "[DONE]") continue;
+          let j; try { j = JSON.parse(data); } catch { continue; }
+          if (j.type === "response.output_text.delta" && j.delta) content += j.delta;
+          if (j.type === "error") { result.error = j.message || "upstream error"; }
+        }
+        result.test_message.content = content.slice(0, 200);
+        if (content) result.ok = true;
+        else if (!result.error) result.error = "上游返回空响应";
+      } else {
+        let parsed = null;
+        try { parsed = JSON.parse(text); } catch {}
+        const out = parsed && upstream.translateResponse ? upstream.translateResponse(parsed) : parsed;
+        const content = ((out && out.choices) || [])[0]?.message?.content || "";
+        result.test_message.content = String(content).slice(0, 200);
+        if (content) result.ok = true;
+      }
     } else {
       const txt = await r.text().catch(() => "");
       result.test_message.error = `HTTP ${r.status} ${txt.slice(0, 400)}`;

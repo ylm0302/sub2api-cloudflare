@@ -35,6 +35,7 @@ export function installFetchMock() {
     }
 
     if (u.host === "api.openai.com") return mockOpenAI(body);
+    if (u.host === "chatgpt.com") return mockCodexResponses(body); // openai OAuth（ChatGPT Codex）
     if (u.host === "api.anthropic.com") return mockAnthropic(body);
     if (u.host === "generativelanguage.googleapis.com") return mockGemini(body, u);
     if (u.host === "api.x.ai") return mockOpenAI(body); // Grok 走 OpenAI 兼容协议
@@ -43,6 +44,22 @@ export function installFetchMock() {
   };
 
   return mock;
+}
+
+// openai OAuth（ChatGPT 网页登录）：走 chatgpt.com/backend-api/codex/responses（Responses 格式，强制 stream:true）
+function mockCodexResponses(body) {
+  if (!body?.stream) {
+    return new Response(JSON.stringify({ detail: "Stream must be set to true" }), {
+      status: 400, headers: { "content-type": "application/json" },
+    });
+  }
+  const sse = [
+    `event: response.created\ndata: ${JSON.stringify({ type: "response.created", response: { id: "resp_1", status: "in_progress" } })}`,
+    `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "Hello" })}`,
+    `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: " world" })}`,
+    `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "resp_1", status: "completed", usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8 } } })}`,
+  ].join("\n\n");
+  return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
 }
 
 function mockOpenAI(body) {

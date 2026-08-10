@@ -99,6 +99,38 @@ export function buildUpstream(acct, body) {
 
   // ---------- OpenAI 兼容（openai / grok / antigravity 走 OpenAI 协议） ----------
   if (platform === "openai" || platform === "grok") {
+    // openai OAuth 账号（ChatGPT 网页登录）：走 ChatGPT 内部 Codex API（对齐原版 sub2api）
+    if (platform === "openai" && cred.kind === "oauth") {
+      const { system, rest } = splitSystem(body.messages || []);
+      const input = rest.map((m) => ({
+        role: m.role === "assistant" ? "assistant" : m.role === "system" ? "system" : "user",
+        content: [{ type: "input_text", text: msgText(m.content) }],
+      }));
+      const out = {
+        model,
+        input: input.length ? input : [{ role: "user", content: [{ type: "input_text", text: "hi" }] }],
+        stream: true, // ChatGPT Codex API 强制流式（实测 stream:false 返回 400）
+        store: false,
+      };
+      if (system) out.instructions = system;
+      return {
+        provider: platform,
+        isStream: true,
+        credential: cred,
+        url: "https://chatgpt.com/backend-api/codex/responses",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${cred.token}`,
+          accept: "text/event-stream",
+          "OpenAI-Beta": "responses=experimental",
+          originator: "codex-tui",
+          "user-agent": "codex-tui/0.44.4",
+        },
+        body: JSON.stringify(out),
+        translateResponse: responsesRespToOpenAI,
+        translator: responsesTranslator,
+      };
+    }
     const out = { ...body, model, stream: isStream };
     if (isStream) {
       out.stream_options = { ...(body.stream_options || {}), include_usage: true };
@@ -640,6 +672,33 @@ export function openAIRespToAnthropic(j, model) {
   };
 }
 
+// ChatGPT Codex /v1/responses 响应 -> OpenAI chat 响应（openai OAuth 上游转换）
+export function responsesRespToOpenAI(j, model) {
+  const text = (j.output || [])
+    .filter((o) => o && (o.type === "message" || o.type === "reasoning"))
+    .flatMap((o) => (o.content || []).map((p) => p.text || ""))
+    .join("");
+  const u = j.usage || {};
+  const inputTokens = u.input_tokens || u.prompt_tokens || 0;
+  const outputTokens = u.output_tokens || u.completion_tokens || 0;
+  return {
+    id: "chatcmpl-" + String(j.id || Date.now()).replace(/^resp_/, ""),
+    object: "chat.completion",
+    created: j.created_at || Math.floor(Date.now() / 1000),
+    model: j.model || model,
+    choices: [{
+      index: 0,
+      message: { role: "assistant", content: text },
+      finish_reason: j.status === "completed" ? "stop" : "stop",
+    }],
+    usage: {
+      prompt_tokens: inputTokens,
+      completion_tokens: outputTokens,
+      total_tokens: inputTokens + outputTokens,
+    },
+  };
+}
+
 // OpenAI chat 响应 -> Responses API 响应（/v1/responses 出站转换）
 export function openAIRespToResponses(j, model) {
   const choice = (j.choices || [])[0] || {};
@@ -880,6 +939,45 @@ export const openaiPassTranslator = {
     return [j];
   },
   flush() { return []; },
+};
+
+// ChatGPT Codex /v1/responses SSE -> OpenAI chat SSE（openai OAuth 上游流式转换）
+export const responsesTranslator = {
+  onData(data, state) {
+    let j; try { j = JSON.parse(data); } catch { return []; }
+    const type = state.event || j.type;
+    const out = [];
+    if (type === "response.output_text.delta") {
+      const text = j.delta;
+      if (text) {
+        if (!state.started) {
+          state.started = true;
+          out.push({ id: "chatcmpl-" + Date.now(), object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: state.model, choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }] });
+        }
+        out.push({ id: "chatcmpl-" + Date.now(), object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: state.model, choices: [{ index: 0, delta: { content: text }, finish_reason: null }] });
+      }
+    } else if (type === "response.completed" && j.response) {
+      const r = j.response;
+      if (r.usage) state.usage = {
+        prompt_tokens: r.usage.input_tokens || 0,
+        completion_tokens: r.usage.output_tokens || 0,
+        total_tokens: (r.usage.input_tokens || 0) + (r.usage.output_tokens || 0),
+      };
+    } else if (type === "error") {
+      state.upstreamError = j.message || "upstream error";
+    }
+    return out;
+  },
+  flush(state) {
+    return [{
+      id: "chatcmpl-" + Date.now(),
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model: state.model,
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      usage: state.usage || undefined,
+    }];
+  },
 };
 
 const anthropicTranslator = {
