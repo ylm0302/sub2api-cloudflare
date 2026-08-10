@@ -741,7 +741,7 @@ async function accountModels(row) {
   const base = (acct.base_url && acct.base_url.trim()) || DEFAULT_BASE[platform];
   const cred = credentialFor(acct);
   const token = cred.token || "";
-  const modelKeys = Object.keys(safeJson(acct.model_map, {}));
+  const modelKeys = Object.keys(acct.model_map);
   const antigravityDefaults = (DEFAULT_MODELS.antigravity || []);
   if (modelKeys.length) return modelKeys;
   if (platform === "antigravity") return [...antigravityDefaults];
@@ -770,7 +770,7 @@ async function testAccountConnection(row, env, modelId) {
   const platform = acct.platform;
   const cred = credentialFor(acct);
   const token = cred.token || "";
-  const models = safeJson(acct.model_map, {});
+  const models = acct.model_map;
   const modelKeys = Object.keys(models);
   // antigravity 无公开模型列表端点，使用内置默认模型（与原版 sub2api 一致）
   const antigravityDefaults = (DEFAULT_MODELS.antigravity || []);
@@ -810,7 +810,7 @@ async function testAccountConnection(row, env, modelId) {
       result.ok = true;
     } else {
       const txt = await r.text().catch(() => "");
-      result.test_message.error = `HTTP ${r.status} ${txt.slice(0, 120)}`;
+      result.test_message.error = `HTTP ${r.status} ${txt.slice(0, 400)}`;
       result.error = result.test_message.error;
     }
   } catch (e) {
