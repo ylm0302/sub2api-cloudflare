@@ -1,7 +1,7 @@
 // index.js — Sub2API-CF 网关入口（Cloudflare Workers + D1，v2）
 import {
   buildUpstream, makeOpenAIStream, openaiPassTranslator,
-  DEFAULT_BASE, OAUTH_TOKEN_URL, needsOAuthRefresh, refreshOAuth,
+  DEFAULT_BASE, DEFAULT_MODELS, OAUTH_TOKEN_URL, needsOAuthRefresh, refreshOAuth,
   anthropicReqToOpenAI, geminiReqToOpenAI, responsesReqToOpenAI,
   openAIRespToAnthropic, openAIRespToGemini, openAIRespToResponses,
   credentialFor, passthroughTranslator,
@@ -743,30 +743,35 @@ async function testAccountConnection(row, env) {
   const token = cred.token || "";
   const models = safeJson(acct.model_map, {});
   const modelKeys = Object.keys(models);
-  const testModel = modelKeys[0] || "gpt-4o-mini";
+  // antigravity 无公开模型列表端点，使用内置默认模型（与原版 sub2api 一致）
+  const antigravityDefaults = (DEFAULT_MODELS.antigravity || []);
+  const testModel = modelKeys[0] || (platform === "antigravity" ? (antigravityDefaults[0] || "gpt-4o-mini") : "gpt-4o-mini");
   const headers = { "content-type": "application/json" };
-  const result = { ok: false, models: modelKeys, test_message: null, error: null };
+  const result = {
+    ok: false,
+    models: modelKeys.length ? modelKeys : (platform === "antigravity" ? [...antigravityDefaults] : []),
+    test_message: null,
+    error: null,
+  };
 
-  // 1. 获取模型列表（非必需，失败不中断测试）
-  try {
-    const v1 = /\/v1\/?$/.test(base) ? "" : "/v1";
-    const modelUrl = platform === "gemini" ? `${base}/v1beta/models?key=${encodeURIComponent(token)}` :
-      platform === "antigravity" ? `${base}/v1internal:generateContent` :
-      `${base}${v1}/models`;
-    const mh = platform === "anthropic" ? { ...headers, "x-api-key": token } :
-      platform === "antigravity" ? { ...headers, authorization: "Bearer " + token } :
-      { ...headers, authorization: "Bearer " + token };
-    const mr = await fetch(modelUrl, { method: platform === "antigravity" ? "POST" : "GET", headers: mh, signal: AbortSignal.timeout(8000) });
-    if (mr.ok) {
-      const mj = await mr.json().catch(() => ({}));
-      const data = mj.data || mj.models || mj;
-      if (Array.isArray(data)) {
-        result.models = data.map((m) => m.id || m.name || "").filter(Boolean);
-      } else if (data && typeof data === "object") {
-        result.models = Object.keys(data);
+  // 1. 获取模型列表（非必需，失败不中断测试）；antigravity 无公开模型列表端点，跳过请求直接使用默认模型
+  if (platform !== "antigravity") {
+    try {
+      const v1 = /\/v1\/?$/.test(base) ? "" : "/v1";
+      const modelUrl = platform === "gemini" ? `${base}/v1beta/models?key=${encodeURIComponent(token)}` : `${base}${v1}/models`;
+      const mh = platform === "anthropic" ? { ...headers, "x-api-key": token } : { ...headers, authorization: "Bearer " + token };
+      const mr = await fetch(modelUrl, { method: "GET", headers: mh, signal: AbortSignal.timeout(8000) });
+      if (mr.ok) {
+        const mj = await mr.json().catch(() => ({}));
+        const data = mj.data || mj.models || mj;
+        if (Array.isArray(data)) {
+          result.models = data.map((m) => m.id || m.name || "").filter(Boolean);
+        } else if (data && typeof data === "object") {
+          result.models = Object.keys(data);
+        }
       }
-    }
-  } catch (e) { /* 模型获取失败不中断 */ }
+    } catch (e) { /* 模型获取失败不中断 */ }
+  }
 
   // 2. 发送测试消息
   try {
