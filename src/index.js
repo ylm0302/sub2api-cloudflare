@@ -706,7 +706,13 @@ const OAUTH_PROVIDERS = {
 
 async function handleAdmin(request, env, url) {
   const token = request.headers.get("x-admin-token") || url.searchParams.get("token");
-  if (token !== env.ADMIN_TOKEN) return json({ error: "unauthorized" }, 401);
+  if (!env.ADMIN_TOKEN) {
+    return json({ error: "ADMIN_TOKEN 未配置：请在 Cloudflare 上执行 wrangler secret put ADMIN_TOKEN 后重试" }, 401);
+  }
+  if (!token) {
+    return json({ error: "缺少管理令牌：请访问 /admin?token=<ADMIN_TOKEN> 或在上方输入框粘贴" }, 401);
+  }
+  if (token !== env.ADMIN_TOKEN) return json({ error: "unauthorized：管理令牌不正确" }, 401);
 
   const db = env.DB;
   const parts = url.pathname.split("/").filter(Boolean);
