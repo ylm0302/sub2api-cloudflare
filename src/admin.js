@@ -480,6 +480,7 @@ function renderAccounts(){
           '<button class="icon-btn" title="编辑" onclick="openAccountModal('+a.id+')">✏️</button>'+
           '<button class="icon-btn" title="'+(a.schedulable?"暂停调度":"恢复调度")+'" onclick="toggleSchedulable('+a.id+')">'+(a.schedulable?"⏸":"▶️")+"</button>"+
           (a.status==="error"?'<button class="icon-btn" title="清除错误" onclick="clearAcctError('+a.id+')">🧹</button>':"")+
+          '<button class="icon-btn" title="测试连接" onclick="testAccount('+a.id+')">🔌</button>'+
           '<button class="icon-btn" title="用量" onclick="openAcctUsage('+a.id+')">📈</button>'+
           '<button class="icon-btn" title="删除" onclick="deleteAccount('+a.id+')">🗑</button>'+
         "</div></td>"+
@@ -492,6 +493,33 @@ function toggleSchedulable(id){
 }
 function clearAcctError(id){
   api("/admin/accounts/"+id+"/clear-error",{method:"POST"}).then(function(){toast("已清除错误","ok");loadAccounts();}).catch(function(e){toast(e.message,"err");});
+}
+function testAccount(id){
+  var a=findAccount(id);
+  if(!a) return;
+  var m=modal("<div style='text-align:center'><div class='sub' style='margin:20px 0'>测试连接中…</div></div>");
+  api("/admin/accounts/"+id+"/test",{method:"POST"}).then(function(r){
+    var html='<div class="card" style="margin:0 0 12px">';
+    html+='<div style="font-weight:700;margin-bottom:6px">🔌 账号连通测试结果</div>';
+    html+='<div>'+(r.ok?badge("b-active","✓ 通过"):badge("b-error","✗ 失败"))+"</div></div>";
+    if(r.models&&r.models.length){
+      html+='<div class="card" style="margin:0 0 12px"><div style="font-weight:600;margin-bottom:4px">可用模型</div><div class="kv">'+esc(r.models.join(", "))+'</div></div>';
+    }
+    if(r.test_message){
+      var tm=r.test_message;
+      html+='<div class="card" style="margin:0 0 12px"><div style="font-weight:600;margin-bottom:4px">测试消息</div>';
+      html+='<div class="kv">模型: '+esc(tm.model_used||"-")+'</div>';
+      html+='<div class="kv">延迟: '+(tm.latency_ms!=null?tm.latency_ms+"ms":"-")+'</div>';
+      html+='<div class="kv">状态: '+(tm.status||"-")+'</div>';
+      if(tm.content) html+='<div class="kv">响应: <code style="background:var(--panel);padding:2px 6px;border-radius:4px">'+esc(tm.content)+'</code></div>';
+      if(tm.error) html+='<div class="warn" style="color:var(--red);margin-top:4px">'+esc(tm.error)+'</div>';
+      html+='</div>';
+    }
+    if(r.error) html+='<div class="card" style="border-color:var(--red)"><div style="color:var(--red)">'+esc(r.error)+'</div></div>';
+    m.innerHTML=html;
+  }).catch(function(e){
+    m.innerHTML='<div class="card" style="text-align:center;color:var(--red)">请求失败: '+esc(e.message)+'</div>';
+  });
 }
 function deleteAccount(id){
   var a=findAccount(id);
@@ -1612,6 +1640,17 @@ function renderHelp(){
 }
 
 /* ---------- 弹窗 ---------- */
+// 简易弹窗：只显示 body 内容，无标题/底部按钮；返回 .modal 元素以便后续替换内容
+function modal(body){
+  var mask=document.createElement("div");
+  mask.className="modal-mask open";
+  mask.id="activeModalMask";
+  mask.innerHTML='<div class="modal"><div class="modal-body">'+body+'</div></div>';
+  $("modalRoot").appendChild(mask);
+  mask.addEventListener("click",function(e){if(e.target===mask)closeModal();});
+  return mask.querySelector(".modal");
+}
+
 function openModal(title,body,foot,wide){
   closeModal();
   var m=document.createElement("div");

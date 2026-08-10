@@ -2,6 +2,7 @@
 import {
   buildUpstream, makeOpenAIStream, openaiPassTranslator,
   DEFAULT_BASE, OAUTH_TOKEN_URL, needsOAuthRefresh, refreshOAuth,
+  ANTIGRAVITY_CLIENT_ID, ANTIGRAVITY_CLIENT_SECRET,
   anthropicReqToOpenAI, geminiReqToOpenAI, responsesReqToOpenAI,
   openAIRespToAnthropic, openAIRespToGemini, openAIRespToResponses,
   credentialFor, passthroughTranslator,
@@ -226,7 +227,8 @@ async function handleChat(request, env, ctx, protocol = "openai", geminiMeta = n
 
   // 跨协议：统一走 OpenAI 格式 -> buildUpstream 转换 -> 响应再转回客户端协议
   const upstream = buildUpstream(acct, openaiBody);
-  if (needsOAuthRefresh(upstream.credential)) {
+  // antigravity：不过期时间判断，直接使用当前 token（原版语义：token 长期有效，不需要刷新重试）
+  if (acct.platform !== "antigravity" && needsOAuthRefresh(upstream.credential)) {
     try {
       const updated = await refreshOAuth(acct.platform, upstream.credential, env);
       const merged = { ...safeJson(acct.credentials, {}), ...updated };
@@ -664,7 +666,8 @@ async function probeAccount(acct, env) {
   let url = "";
 
   // oauth 过期/临期：先尝试刷新，避免“一键检测”对可恢复账号误报
-  if (needsOAuthRefresh(cred)) {
+  // antigravity：不过期时间判断，直接使用当前 token（原版语义：token 长期有效，不需要刷新重试）
+  if (acct.platform !== "antigravity" && needsOAuthRefresh(cred)) {
     try {
       const updated = await refreshOAuth(acct.platform, cred, env);
       const merged = { ...safeJson(acct.credentials, {}), ...updated };
@@ -731,6 +734,77 @@ function parseProbeResult(v) {
   return { ok: false, latency_ms: null, error: String(v == null ? "health check failed" : v).slice(0, 200) };
 }
 
+// 单账号连通测试：仿原版 TestAccountConnection，获取模型列表 + 发送测试消息
+async function testAccountConnection(row, env) {
+  const db = env.DB;
+  const acct = { ...row, credentials: row.credentials, model_map: safeJson(row.model_map, {}) };
+  const platform = acct.platform;
+  const base = (acct.base_url && acct.base_url.trim()) || DEFAULT_BASE[platform];
+  const cred = credentialFor(acct);
+  const token = cred.token || "";
+  const models = safeJson(acct.model_map, {});
+  const modelKeys = Object.keys(models);
+  const testModel = modelKeys[0] || "gpt-4o-mini";
+  const headers = { "content-type": "application/json" };
+  const result = { ok: false, models: modelKeys, test_message: null, error: null };
+
+  // 1. 获取模型列表（非必需，失败不中断测试）
+  try {
+    const v1 = /\/v1\/?$/.test(base) ? "" : "/v1";
+    const modelUrl = platform === "gemini" ? `${base}/v1beta/models?key=${encodeURIComponent(token)}` :
+      platform === "antigravity" ? `${base}/v1internal:generateContent` :
+      `${base}${v1}/models`;
+    const mh = platform === "anthropic" ? { ...headers, "x-api-key": token } :
+      platform === "antigravity" ? { ...headers, authorization: "Bearer " + token } :
+      { ...headers, authorization: "Bearer " + token };
+    const mr = await fetch(modelUrl, { method: platform === "antigravity" ? "POST" : "GET", headers: mh, signal: AbortSignal.timeout(8000) });
+    if (mr.ok) {
+      const mj = await mr.json().catch(() => ({}));
+      const data = mj.data || mj.models || mj;
+      if (Array.isArray(data)) {
+        result.models = data.map((m) => m.id || m.name || "").filter(Boolean);
+      } else if (data && typeof data === "object") {
+        result.models = Object.keys(data);
+      }
+    }
+  } catch (e) { /* 模型获取失败不中断 */ }
+
+  // 2. 发送测试消息
+  try {
+    const testBody = {
+      model: testModel,
+      messages: [{ role: "user", content: "Say 'ok' in one word" }],
+      max_tokens: 10,
+      stream: false,
+    };
+    const upstream = buildUpstream(acct, testBody);
+    const t0 = now();
+    const r = await fetch(upstream.url, {
+      method: "POST",
+      headers: upstream.headers,
+      body: upstream.body,
+      signal: AbortSignal.timeout(15000),
+    });
+    const latency = now() - t0;
+    result.test_message = { model_used: testModel, latency_ms: latency, status: r.status };
+    if (r.ok) {
+      const j = await r.json().catch(() => ({}));
+      const out = upstream.translateResponse ? upstream.translateResponse(j) : j;
+      const content = ((out.choices || [])[0] || {}).message?.content || "";
+      result.test_message.content = content.slice(0, 200);
+      result.ok = true;
+    } else {
+      const txt = await r.text().catch(() => "");
+      result.test_message.error = `HTTP ${r.status} ${txt.slice(0, 120)}`;
+      result.error = result.test_message.error;
+    }
+  } catch (e) {
+    result.error = String(e.message || e).slice(0, 200);
+    result.test_message = { model_used: testModel, error: result.error };
+  }
+  return result;
+}
+
 // 审计日志写入
 async function audit(env, action, targetType, targetId, detail) {
   try {
@@ -773,9 +847,12 @@ const OAUTH_PROVIDERS = {
   antigravity: {
     authorizeUrl: "https://accounts.google.com/o/oauth2/v2/auth",
     tokenUrl: "https://oauth2.googleapis.com/token",
-    scope: "https://www.googleapis.com/auth/generative-language",
+    // 与原版 Antigravity-Manager 一致的 scopes 与内置客户端（可用环境变量覆盖）
+    scope: "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs",
     clientIdEnv: "ANTIGRAVITY_OAUTH_CLIENT_ID",
     clientSecretEnv: "ANTIGRAVITY_OAUTH_CLIENT_SECRET",
+    defaultClientId: ANTIGRAVITY_CLIENT_ID,
+    defaultClientSecret: ANTIGRAVITY_CLIENT_SECRET,
   },
 };
 
@@ -920,6 +997,13 @@ async function handleAdmin(request, env, url) {
         await db.prepare("UPDATE accounts_v2 SET status='active', error_message=NULL WHERE id=?").bind(sub).run();
         return json({ ok: true });
       }
+      // POST /admin/accounts/:id/test —— 单账号连通测试（获取模型 + 发送测试消息，仿原版 TestAccountConnection）
+      if (sub2 === "test") {
+        const row = await db.prepare("SELECT * FROM accounts_v2 WHERE id=?").bind(sub).first();
+        if (!row) return json({ error: "account not found" }, 404);
+        const result = await testAccountConnection(row, env);
+        return json(result);
+      }
     }
     // PATCH /admin/accounts/:id —— 更新账号字段
     if (request.method === "PATCH" && sub && !sub2) {
@@ -1015,7 +1099,7 @@ async function handleAdmin(request, env, url) {
       const provider = url.searchParams.get("provider") || "";
       const cfg = OAUTH_PROVIDERS[provider];
       if (!cfg) return json({ error: "unknown provider: " + provider }, 400);
-      const clientId = env[cfg.clientIdEnv];
+      const clientId = env[cfg.clientIdEnv] || cfg.defaultClientId;
       if (!clientId) return json({ error: "OAUTH_CLIENT_ID not configured for " + provider }, 400);
       const state = crypto.randomUUID();
       const redirect = new URL(url.origin + "/admin/oauth/callback");
@@ -1036,8 +1120,8 @@ async function handleAdmin(request, env, url) {
       const code = url.searchParams.get("code") || "";
       const cfg = OAUTH_PROVIDERS[provider];
       if (!cfg || !code) return json({ error: "invalid oauth callback" }, 400);
-      const clientId = env[cfg.clientIdEnv];
-      const clientSecret = env[cfg.clientSecretEnv];
+      const clientId = env[cfg.clientIdEnv] || cfg.defaultClientId;
+      const clientSecret = env[cfg.clientSecretEnv] || cfg.defaultClientSecret;
       if (!clientId || !clientSecret) return json({ error: "oauth client not configured" }, 400);
       const redirect = new URL(url.origin + "/admin/oauth/callback");
       redirect.searchParams.set("provider", provider);

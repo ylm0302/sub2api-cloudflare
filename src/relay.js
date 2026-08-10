@@ -260,8 +260,8 @@ export async function refreshOAuth(platform, cred, env) {
   const params = new URLSearchParams();
   params.set("grant_type", "refresh_token");
   params.set("refresh_token", cred.refresh_token);
-  // Antigravity 账号的 credentials 不含 client_id，使用官方 Antigravity OAuth 客户端
-  if (platform === "antigravity") params.set("client_id", cred.client_id || (env && env.ANTIGRAVITY_OAUTH_CLIENT_ID));
+  // Antigravity 账号的 credentials 不含 client_id，使用官方 Antigravity OAuth 客户端（可用环境变量覆盖）
+  if (platform === "antigravity") params.set("client_id", cred.client_id || (env && env.ANTIGRAVITY_OAUTH_CLIENT_ID) || "");
   else if (cred.client_id) params.set("client_id", cred.client_id);
   // Google 系（gemini/antigravity）需要 client_secret；antigravity 有内置默认值，可用环境变量覆盖
   if (platform === "gemini" && env && env.GEMINI_OAUTH_CLIENT_SECRET) {

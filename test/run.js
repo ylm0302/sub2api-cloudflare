@@ -1133,19 +1133,20 @@ async function integrationTests(mock) {
     await ctx.drain();
   });
 
-  await test("Antigravity OAuth 刷新：过期 token 自动走 Google oauth2 刷新", async () => {
+  await test("Antigravity：不过期时间判断，token 保持原样（对齐原版语义）", async () => {
     const { db, env, ctx } = setup();
     await seedAccount(db, {
       provider: "antigravity", name: "ag", type: "oauth",
       credentials: { access_token: "ya29.stale", refresh_token: "1//rt", project_id: "proj-1", expires_at: Date.now() - 1000 },
     });
     const key = await seedKey(db);
-    // mock 里给 oauth2.googleapis.com 返回新 token
+    let refreshCalled = false;
     const orig = globalThis.fetch;
     globalThis.fetch = async (url, opts = {}) => {
       const u = new URL(String(url));
       if (u.host === "oauth2.googleapis.com" && u.pathname === "/token") {
-        return new Response(JSON.stringify({ access_token: "ya29.fresh", expires_in: 3600, token_type: "Bearer" }), {
+        refreshCalled = true;
+        return new Response(JSON.stringify({ access_token: "ya29.fresh", expires_in: 3600 }), {
           status: 200, headers: { "content-type": "application/json" },
         });
       }
@@ -1160,19 +1161,14 @@ async function integrationTests(mock) {
         }),
         env, ctx
       );
-      eq(r.status, 200, "刷新后调用成功");
+      eq(r.status, 200, "调用成功");
       const j = await r.json();
       eq(j.choices[0].message.content, "Hello world", "内容");
-      // 新 token 已写回
+      // token 保持原样，未触发刷新
       const row = await db.prepare("SELECT credentials FROM accounts_v2 WHERE name=?").bind("ag").first();
       const cred = JSON.parse(row.credentials);
-      if (cred.access_token !== "ya29.fresh") {
-        const st = await db.prepare("SELECT status, error_message FROM accounts_v2 WHERE name=?").bind("ag").first();
-        console.error("  [debug] status=", st.status, "err=", st.error_message);
-        console.error("  [debug] creds=", row.credentials);
-        console.error("  [debug] last calls=", JSON.stringify(mock.calls.slice(-4).map((c) => c.host + c.url.replace(/^https?:\/\/[^/]+/, ""))));
-      }
-      eq(cred.access_token, "ya29.fresh", "新 access_token 写回");
+      eq(cred.access_token, "ya29.stale", "token 未变（antigravity 不过期时间判断）");
+      eq(refreshCalled, false, "未触发 Google 刷新");
     } finally {
       globalThis.fetch = orig;
     }
