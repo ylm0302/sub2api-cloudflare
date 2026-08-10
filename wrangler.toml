@@ -1,4 +1,4 @@
-name = "sub2api-cf"
+name = "sub2api-cloudflare"
 main = "src/index.js"
 compatibility_date = "2025-06-01"
 compatibility_flags = ["nodejs_compat"]
