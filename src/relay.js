@@ -454,21 +454,22 @@ function openAIToAntigravity(body, model, projectId) {
         if (!tc || tc.type !== "function" || !tc.function || !tc.function.name) continue;
         let args = {};
         try { args = JSON.parse(tc.function.arguments || "{}"); } catch {}
-        parts.push({ functionCall: { name: tc.function.name, args } });
+        const call = { name: tc.function.name, args };
+        if (tc.id) call.id = tc.id;
+        // Gemini 要求 functionCall 带 thoughtSignature（对齐原版：优先真实 signature，缺失用 dummy）
+        call.thoughtSignature = tc.signature || "skip_thought_signature_validator";
+        parts.push({ functionCall: call });
       }
     }
     // user tool 消息 -> functionResponse 部分（结果文本内嵌在 response 里，不额外发 text part）
     if (m.role === "tool" && m.tool_call_id) {
-      const name = toolIdToName[m.tool_call_id] || m.name || "tool";
-      // Gemini 要求 function_response.response 是 Struct（对象）；标量/数组需包一层 output
-      let resp;
-      try {
-        const parsed = JSON.parse(m.content);
-        resp = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : { output: String(m.content == null ? "" : m.content) };
-      } catch {
-        resp = { output: String(m.content == null ? "" : m.content) };
-      }
-      parts.push({ functionResponse: { name, response: resp } });
+      const name = toolIdToName[m.tool_call_id] || m.name || m.tool_call_id;
+      // 对齐原版：response 包成 { result: <内容> }，并回带 id 关联 functionCall
+      let content = m.content == null ? "" : String(m.content);
+      if (Array.isArray(m.content)) content = m.content.map((p) => (typeof p === "string" ? p : p && p.text != null ? p.text : JSON.stringify(p))).join("");
+      const fr = { name, response: { result: content } };
+      if (m.tool_call_id) fr.id = m.tool_call_id;
+      parts.push({ functionResponse: fr });
     } else {
       const text = msgText(m.content);
       if (text) parts.push({ text });
@@ -675,6 +676,8 @@ function claudeContentToOpenAIMessages(m, messages) {
       id: tu.id || ("call_" + Math.random().toString(36).slice(2, 10)),
       type: "function",
       function: { name: tu.name, arguments: JSON.stringify(tu.input || {}) },
+      // 透传 Claude tool_use 的 signature，供 antigravity functionCall 的 thoughtSignature 使用
+      signature: tu.signature || "",
     })) };
     messages.push(msg);
   } else if (text || !toolUses.length) {

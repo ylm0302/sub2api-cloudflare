@@ -1263,6 +1263,46 @@ async function integrationTests(mock) {
     await ctx.drain();
   });
 
+  await test("POST /v1/messages 多轮工具调用：functionCall 带 thoughtSignature + functionResponse", async () => {
+    const { db, env, ctx } = setup();
+    await seedAccount(db, {
+      provider: "antigravity", name: "ag-mt", type: "oauth",
+      credentials: { access_token: "ya29.test", refresh_token: "1//rt", project_id: "proj-1" },
+    });
+    const key = await seedKey(db);
+    const callsBefore = mock.calls.length;
+    const r = await worker.fetch(
+      new Request("https://x/v1/messages", {
+        method: "POST",
+        headers: { "x-api-key": key, "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-6", max_tokens: 100, stream: true,
+          tools: [{ name: "Bash", description: "Run a bash command", input_schema: { type: "object" } }],
+          messages: [
+            { role: "user", content: "what is 2+2?" },
+            { role: "assistant", content: [{ type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "echo 4" } }] },
+            { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "4" }] },
+          ],
+        }),
+      }),
+      env, ctx
+    );
+    eq(r.status, 200, "status 200");
+    const sse = await readBody(r);
+    const evs = parseSSE(sse);
+    assert(evs.some((e) => e.type === "message_stop"), "以 message_stop 结束");
+    // 检查上游请求：functionCall 带 thoughtSignature，functionResponse 带 {result: "4"}
+    const agCalls = mock.calls.slice(callsBefore).filter((c) => c.host === "cloudcode-pa.googleapis.com");
+    assert(agCalls.length > 0, "发往 antigravity 上游");
+    const contents = agCalls[0].body.request.contents;
+    const fcPart = contents.find((c) => c.role === "model").parts.find((p) => p.functionCall);
+    assert(fcPart && fcPart.functionCall.thoughtSignature, "functionCall 带 thoughtSignature");
+    const frPart = contents.flatMap((c) => (c.parts || [])).find((p) => p.functionResponse);
+    assert(frPart && frPart.functionResponse.name === "Bash", "functionResponse 名称映射正确");
+    eq(frPart.functionResponse.response.result, "4", "functionResponse 内容包在 result 里");
+    await ctx.drain();
+  });
+
   await test("POST /v1/messages 带 tools 非流式 → Antigravity 返回 tool_use 内容块", async () => {
     const { db, env, ctx } = setup();
     await seedAccount(db, {
