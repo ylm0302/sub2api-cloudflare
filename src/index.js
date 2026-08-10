@@ -1,6 +1,6 @@
 // index.js — Sub2API-CF 网关入口（Cloudflare Workers + D1，v2）
 import {
-  buildUpstream, makeOpenAIStream, openaiPassTranslator,
+  buildUpstream, makeOpenAIStream, makeOpenAIStreamRetryable, openaiPassTranslator,
   DEFAULT_BASE, DEFAULT_MODELS, OAUTH_TOKEN_URL, needsOAuthRefresh, refreshOAuth,
   anthropicReqToOpenAI, geminiReqToOpenAI, responsesReqToOpenAI,
   openAIRespToAnthropic, openAIRespToGemini, openAIRespToResponses,
@@ -222,53 +222,75 @@ async function handleChat(request, env, ctx, protocol = "openai", geminiMeta = n
   }
 
   // 选账号：Sub2API 风格调度（可带分组平台过滤 + 模型维度路由）
-  const acct = await selectAccount(db, groupPlatform || null, openaiBody.model);
-  if (!acct) return json({ error: "no available upstream account" }, 503);
+  // 空响应自动重试：拉取最多 3 个候选账号，上游返回空内容/错误时自动切换下一个
+  const candidates = await selectAccounts(db, groupPlatform || null, openaiBody.model, 3);
+  if (!candidates.length) return json({ error: "no available upstream account" }, 503);
+  const tried = new Set();
+  let attempted = 0;
+  let busy = false;
 
-  // 账号级并发限制（进程内计数，上限 = 账号 concurrency）
-  if (!acqSlot(env, acct.id, acct.concurrency || 1)) {
-    return json({ error: "account busy, retry later", account_id: acct.id }, 429);
-  }
-  ctx.waitUntil(releaseSlotLater(env, acct.id));
+  for (const acct of candidates) {
+    if (tried.has(acct.id)) continue;
+    tried.add(acct.id);
 
-  ctx.waitUntil(
-    db.prepare("UPDATE accounts_v2 SET last_used_at = ? WHERE id = ?").bind(now(), acct.id).run()
-  );
-
-  // 同协议直通：anthropic 入站 + anthropic 账号，或 gemini 入站 + gemini 账号，
-  // 直接透传原生请求（保留 tools/thinking 等语义），只捕获用量。
-  // antigravity 不走直通：它在 relay 层有独立的 v1internal 协议适配（OpenAI 双向转换）。
-  const sameProtocol =
-    (protocol === "anthropic" && acct.platform === "anthropic") ||
-    (protocol === "gemini" && acct.platform === "gemini");
-  if (sameProtocol) {
-    return await relaySameProtocol(request, env, ctx, acct, body, keyRow, protocol, geminiMeta);
-  }
-
-  // 跨协议：统一走 OpenAI 格式 -> buildUpstream 转换 -> 响应再转回客户端协议
-  const upstream = buildUpstream(acct, openaiBody);
-  // antigravity：不过期时间判断，直接使用当前 token（原版语义：token 长期有效，不需要刷新重试）
-  if (acct.platform !== "antigravity" && needsOAuthRefresh(upstream.credential)) {
-    try {
-      const updated = await refreshOAuth(acct.platform, upstream.credential, env);
-      const merged = { ...safeJson(acct.credentials, {}), ...updated };
-      await db
-        .prepare("UPDATE accounts_v2 SET credentials = ?, status = 'active', error_message = NULL WHERE id = ?")
-        .bind(JSON.stringify(merged), acct.id)
-        .run();
-      // 用新 token 重建上游
-      const freshAcct = { ...acct, credentials: JSON.stringify(merged) };
-      const fresh = buildUpstream(freshAcct, openaiBody);
-      return await relayToUpstream(fresh, freshAcct, openaiBody, keyRow, env, ctx, protocol);
-    } catch (e) {
-      // 刷新失败：标记账号错误，但允许本次尝试（可能 token 仍有效）
-      await db
-        .prepare("UPDATE accounts_v2 SET status = 'error', error_message = ? WHERE id = ?")
-        .bind(String(e).slice(0, 500), acct.id)
-        .run();
+    // 账号级并发限制（进程内计数，上限 = 账号 concurrency）
+    if (!acqSlot(env, acct.id, acct.concurrency || 1)) {
+      busy = true;
+      continue;
     }
+    ctx.waitUntil(releaseSlotLater(env, acct.id));
+    ctx.waitUntil(
+      db.prepare("UPDATE accounts_v2 SET last_used_at = ? WHERE id = ?").bind(now(), acct.id).run()
+    );
+
+    // 同协议直通：anthropic 入站 + anthropic 账号，或 gemini 入站 + gemini 账号，
+    // 直接透传原生请求（保留 tools/thinking 等语义），只捕获用量。
+    // antigravity 不走直通：它在 relay 层有独立的 v1internal 协议适配（OpenAI 双向转换）。
+    const sameProtocol =
+      (protocol === "anthropic" && acct.platform === "anthropic") ||
+      (protocol === "gemini" && acct.platform === "gemini");
+    if (sameProtocol) {
+      return await relaySameProtocol(request, env, ctx, acct, body, keyRow, protocol, geminiMeta);
+    }
+
+    // 跨协议：统一走 OpenAI 格式 -> buildUpstream 转换 -> 响应再转回客户端协议
+    let upstream = buildUpstream(acct, openaiBody);
+    // antigravity：不过期时间判断，直接使用当前 token（原版语义：token 长期有效，不需要刷新重试）
+    if (acct.platform !== "antigravity" && needsOAuthRefresh(upstream.credential)) {
+      try {
+        const updated = await refreshOAuth(acct.platform, upstream.credential, env);
+        const merged = { ...safeJson(acct.credentials, {}), ...updated };
+        await db
+          .prepare("UPDATE accounts_v2 SET credentials = ?, status = 'active', error_message = NULL WHERE id = ?")
+          .bind(JSON.stringify(merged), acct.id)
+          .run();
+        // 用新 token 重建上游
+        const freshAcct = { ...acct, credentials: JSON.stringify(merged) };
+        upstream = buildUpstream(freshAcct, openaiBody);
+      } catch (e) {
+        // 刷新失败：标记账号错误，继续尝试下一个候选账号
+        await db
+          .prepare("UPDATE accounts_v2 SET status = 'error', error_message = ? WHERE id = ?")
+          .bind(String(e).slice(0, 500), acct.id)
+          .run();
+        continue;
+      }
+    }
+    attempted++;
+    const retryable = tried.size < candidates.length;
+    const result = await relayToUpstream(upstream, acct, openaiBody, keyRow, env, ctx, protocol, retryable);
+    if (result && result.__emptyRetry) {
+      // 空响应/上游错误：软隔离该账号 60s，避免后续请求继续命中，再试下一个候选
+      await db
+        .prepare("UPDATE accounts_v2 SET temp_unschedulable_until = ? WHERE id = ?")
+        .bind(now() + 60 * 1000, acct.id)
+        .run();
+      continue;
+    }
+    return result;
   }
-  return await relayToUpstream(upstream, acct, openaiBody, keyRow, env, ctx, protocol);
+  if (!attempted && busy) return json({ error: "account busy, retry later" }, 429);
+  return json({ error: "all upstream accounts failed or returned empty responses", retry: true }, 502);
 }
 
 // 同协议直通转发：请求体原样发给上游（只替换鉴权头），响应透传，同时捕获用量落库。
@@ -384,6 +406,36 @@ async function selectAccount(db, platform = null, model = null) {
   return db.prepare(`${base} ORDER BY priority ASC, last_used_at ASC LIMIT 1`).bind(...vals).first();
 }
 
+// 候选账号列表（空响应自动重试用）：与 selectAccount 相同的调度条件，取最多 limit 个，
+// 按 priority ASC / last_used_at ASC 排序（最近最少使用优先）。
+async function selectAccounts(db, platform = null, model = null, limit = 3) {
+  const t = now();
+  const where = [
+    "schedulable = 1 AND status = 'active'",
+    "(rate_limit_reset_at IS NULL OR rate_limit_reset_at < ?)",
+    "(overload_until IS NULL OR overload_until < ?)",
+    "(temp_unschedulable_until IS NULL OR temp_unschedulable_until < ?)",
+  ];
+  const vals = [t, t, t];
+  if (platform) {
+    where.push("platform = ?");
+    vals.push(platform);
+  }
+  const base = `SELECT * FROM accounts_v2 WHERE ${where.join(" AND ")}`;
+  if (model) {
+    const esc = String(model).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    const rows = await db
+      .prepare(
+        `${base} AND (json_extract(model_map, '$."${esc}"') IS NOT NULL OR model_map IS NULL OR TRIM(COALESCE(model_map, '')) IN ('', '{}')) ORDER BY priority ASC, last_used_at ASC LIMIT ?`
+      )
+      .bind(...vals, limit)
+      .all();
+    if (rows && rows.results && rows.results.length) return rows.results;
+  }
+  const rows = await db.prepare(`${base} ORDER BY priority ASC, last_used_at ASC LIMIT ?`).bind(...vals, limit).all();
+  return (rows && rows.results) || [];
+}
+
 // ---------- 进程内限流 / 并发信号量 ----------
 // Workers 无共享内存，但同一 isolate 内的请求共享此 Map，可做尽力而为的限制；
 // 多 isolate 并发时由 D1 原子计数兜底（见下方 D1 版本选路提示）。
@@ -439,7 +491,7 @@ export function __resetRuntimeState() {
 
 // clientProtocol：客户端期望的响应协议（"openai" | "anthropic" | "gemini"）。
 // 上游响应统一转成 OpenAI 格式后，再转回客户端协议。
-async function relayToUpstream(upstream, acct, body, keyRow, env, ctx, clientProtocol = "openai") {
+async function relayToUpstream(upstream, acct, body, keyRow, env, ctx, clientProtocol = "openai", retryEmpty = false) {
   const model = (safeJson(acct.model_map, {})[body.model]) || body.model;
   let upstreamResp;
   try {
@@ -477,6 +529,15 @@ async function relayToUpstream(upstream, acct, body, keyRow, env, ctx, clientPro
         openai = null;
       }
     }
+    // 空响应 / 上游错误状态 → 通知调用方切换下一个候选账号
+    if (retryEmpty) {
+      const choice = (openai && openai.choices && openai.choices[0]) || {};
+      const msg = choice.message || {};
+      const hasText = typeof msg.content === "string" && msg.content.length > 0;
+      const hasTools = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
+      const isEmptyOk = !!openai && !hasText && !hasTools && Array.isArray(openai.choices) && openai.choices.length > 0;
+      if (upstreamResp.status !== 200 || isEmptyOk) return { __emptyRetry: true };
+    }
     const usage = openai && openai.usage;
     if (usage) ctx.waitUntil(logUsage(env, keyRow, acct, model, usage));
     let out = text;
@@ -494,6 +555,8 @@ async function relayToUpstream(upstream, acct, body, keyRow, env, ctx, clientPro
 
   if (upstreamResp.status !== 200) {
     const errText = await upstreamResp.text();
+    // 还有候选账号时：429/401/403/5xx 等错误状态也切换下一个账号
+    if (retryEmpty) return { __emptyRetry: true };
     return new Response(errText, {
       status: upstreamResp.status,
       headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
@@ -501,9 +564,28 @@ async function relayToUpstream(upstream, acct, body, keyRow, env, ctx, clientPro
   }
   const state = { model, provider: upstream.provider, usage: null };
   const translator = upstream.translator || openaiPassTranslator;
-  const stream = makeOpenAIStream(upstreamResp.body, translator, state, async (st) => {
+  const onDone = async (st) => {
     if (st.usage) await logUsage(env, keyRow, acct, model, st.usage);
-  }, clientProtocol);
+  };
+  if (retryEmpty) {
+    // 空响应自动重试：缓冲到首个内容 chunk 或 EOF 判断空/非空，空则换下一个账号
+    const { stream, emptiness } = makeOpenAIStreamRetryable(upstreamResp.body, translator, state, onDone, clientProtocol);
+    const empty = await Promise.race([
+      emptiness,
+      new Promise((r) => setTimeout(() => r(false), 25000)), // 首个内容 25s 未到：按非空放行，避免阻塞
+    ]);
+    if (empty) return { __emptyRetry: true };
+    return new Response(stream, {
+      status: 200,
+      headers: {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-store",
+        "connection": "keep-alive",
+        "x-accel-buffering": "no",
+      },
+    });
+  }
+  const stream = makeOpenAIStream(upstreamResp.body, translator, state, onDone, clientProtocol);
   return new Response(stream, {
     status: 200,
     headers: {

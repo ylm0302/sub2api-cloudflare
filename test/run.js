@@ -1085,6 +1085,71 @@ async function integrationTests(mock) {
     await ctx.drain();
   });
 
+  await test("空响应自动重试：上游空流 → 自动切换下一个候选账号", async () => {
+    const { db, env, ctx } = setup();
+    // 账号 A：proj-empty（mock 返回空流）优先，账号 B：proj-ok 正常兜底
+    await seedAccount(db, {
+      provider: "antigravity", name: "ag-empty", type: "oauth",
+      credentials: { access_token: "ya29.empty", refresh_token: "1//rt", project_id: "proj-empty" },
+      priority: 1,
+    });
+    await seedAccount(db, {
+      provider: "antigravity", name: "ag-ok", type: "oauth",
+      credentials: { access_token: "ya29.ok", refresh_token: "1//rt", project_id: "proj-ok" },
+      priority: 2,
+    });
+    const key = await seedKey(db);
+    const callStart = mock.calls.length;
+    const r = await worker.fetch(
+      new Request("https://x/v1/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer " + key, "content-type": "application/json" },
+        body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 100, stream: true, messages: [{ role: "user", content: "hi" }] }),
+      }),
+      env, ctx
+    );
+    eq(r.status, 200, "重试后返回 200");
+    const sse = await readBody(r);
+    const chunks = parseSSE(sse);
+    const texts = chunks.filter((c) => c.choices && c.choices[0].delta && c.choices[0].delta.content).map((c) => c.choices[0].delta.content);
+    eq(texts.join(""), "Hello world", "内容来自第二个账号（重试成功）");
+    const agCalls = mock.calls.slice(callStart).filter((c) => c.host === "cloudcode-pa.googleapis.com");
+    eq(agCalls.length, 2, "两个候选账号都被尝试");
+    eq(agCalls[0].body.project, "proj-empty", "先试空响应账号");
+    eq(agCalls[1].body.project, "proj-ok", "再试正常账号");
+    await ctx.drain();
+  });
+
+  await test("空响应自动重试（非流式）：上游空 JSON → 自动切换下一个候选账号", async () => {
+    const { db, env, ctx } = setup();
+    await seedAccount(db, {
+      provider: "antigravity", name: "ag-empty", type: "oauth",
+      credentials: { access_token: "ya29.empty", refresh_token: "1//rt", project_id: "proj-empty" },
+      priority: 1,
+    });
+    await seedAccount(db, {
+      provider: "antigravity", name: "ag-ok", type: "oauth",
+      credentials: { access_token: "ya29.ok", refresh_token: "1//rt", project_id: "proj-ok" },
+      priority: 2,
+    });
+    const key = await seedKey(db);
+    const callStart = mock.calls.length;
+    const r = await worker.fetch(
+      new Request("https://x/v1/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer " + key, "content-type": "application/json" },
+        body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 100, messages: [{ role: "user", content: "hi" }] }),
+      }),
+      env, ctx
+    );
+    eq(r.status, 200, "重试后返回 200");
+    const j = await r.json();
+    eq(j.choices[0].message.content, "Hello world", "内容来自第二个账号（非流式重试成功）");
+    const agCalls = mock.calls.slice(callStart).filter((c) => c.host === "cloudcode-pa.googleapis.com");
+    eq(agCalls.length, 2, "两个候选账号都被尝试");
+    await ctx.drain();
+  });
+
   await test("POST /v1/messages（Anthropic 入站）→ Antigravity 账号（Claude 协议转换）", async () => {
     const { db, env, ctx } = setup();
     await seedAccount(db, {

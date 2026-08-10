@@ -116,6 +116,21 @@ function mockAnthropic(body) {
 
 function mockAntigravity(body, u) {
   // 真实 Antigravity v1internal 响应（V1InternalResponse 包装）
+  // project 为 proj-empty 时返回空响应（模拟上游配额耗尽/静默空流），用于测试空响应自动重试
+  if (body && body.project === "proj-empty") {
+    const isStream = u.pathname.endsWith("streamGenerateContent");
+    if (isStream) {
+      const sse = [
+        `data: ${JSON.stringify({ response: { candidates: [], usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 0 } } })}`,
+        `data: [DONE]`,
+      ].join("\n\n");
+      return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }
+    return new Response(JSON.stringify({ response: { candidates: [], usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 0 } } }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
   const geminiResp = (text) => ({
     response: {
       candidates: [{ index: 0, content: { role: "model", parts: [{ text }] }, finishReason: "STOP" }],

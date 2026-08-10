@@ -1197,3 +1197,117 @@ export function makeOpenAIStream(upstreamBody, translator, state, onDone, client
     },
   });
 }
+
+// 空响应自动重试用的流：自驱动读取上游 body，缓冲到“出现首个有内容的 chunk”或 EOF 才放行。
+// 返回 { stream, emptiness }：
+//   - 上游正常（首个内容 chunk 到达）→ emptiness resolve false，缓冲放行，之后实时透传
+//   - 上游空响应（流结束仍无任何内容）→ emptiness resolve true，stream 不会被客户端消费
+// start 驱动（非 pull 驱动），避免返回 Response 前无人拉取导致的死锁。
+export function makeOpenAIStreamRetryable(upstreamBody, translator, state, onDone, clientProtocol = "openai") {
+  const reader = upstreamBody.getReader();
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  let buf = "";
+  let released = false;
+  let empty = true;
+  const pending = []; // 已转换但尚未放行的源 chunk
+  let resolveEmpty = null;
+  const emptiness = new Promise((r) => (resolveEmpty = r));
+
+  function chunkHasContent(c) {
+    if (!c || typeof c !== "object") return false;
+    const d = (c.choices && c.choices[0] && c.choices[0].delta) || {};
+    return typeof d.content === "string" && d.content.length > 0;
+  }
+
+  function emit(controller, c) {
+    if (c == null) return;
+    if (clientProtocol === "anthropic") {
+      for (const ev of openAIChunkToAnthropic(c, state)) {
+        controller.enqueue(encoder.encode("data: " + JSON.stringify(ev) + "\n\n"));
+      }
+    } else if (clientProtocol === "gemini") {
+      for (const g of openAIChunkToGemini(c, state)) {
+        controller.enqueue(encoder.encode("data: " + JSON.stringify(g) + "\n\n"));
+      }
+    } else if (clientProtocol === "responses") {
+      for (const ev of openAIChunkToResponses(c, state)) {
+        controller.enqueue(encoder.encode("event: " + ev.event + "\ndata: " + JSON.stringify(ev.data) + "\n\n"));
+      }
+    } else {
+      controller.enqueue(encoder.encode("data: " + JSON.stringify(c) + "\n\n"));
+    }
+  }
+
+  function release(controller) {
+    if (released) return;
+    released = true;
+    for (const c of pending) emit(controller, c);
+    pending.length = 0;
+  }
+
+  function consume(controller, isFinal) {
+    if (!buf) return;
+    const lines = buf.split("\n");
+    if (!isFinal) buf = lines.pop() || "";
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (!line) continue;
+      if (line.startsWith("event:")) { state.event = line.slice(6).trim(); continue; }
+      if (line.startsWith("data:")) {
+        const data = line.slice(5).trim();
+        if (data === "[DONE]") continue;
+        const chunks = translator.onData(data, state) || [];
+        for (const c of chunks) {
+          if (chunkHasContent(c)) empty = false;
+          if (!released) { pending.push(c); continue; }
+          emit(controller, c);
+        }
+        // 首个内容 chunk 到达：放行缓冲并标记非空
+        if (!released && !empty) {
+          release(controller);
+          if (resolveEmpty) { resolveEmpty(false); resolveEmpty = null; }
+        }
+      }
+    }
+  }
+
+  const stream = new ReadableStream({
+    start(controller) {
+      (async () => {
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) {
+              consume(controller, true);
+              if (clientProtocol === "anthropic") {
+                for (const ev of flushAnthropic(state)) {
+                  controller.enqueue(encoder.encode("data: " + JSON.stringify(ev) + "\n\n"));
+                }
+              } else if (clientProtocol === "responses") {
+                for (const ev of flushResponses(state)) {
+                  controller.enqueue(encoder.encode("event: " + ev.event + "\ndata: " + JSON.stringify(ev.data) + "\n\n"));
+                }
+              } else {
+                const tail = translator.flush ? (translator.flush(state) || []) : [];
+                for (const c of tail) emit(controller, c);
+              }
+              if (resolveEmpty) { resolveEmpty(empty); resolveEmpty = null; }
+              controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+              if (onDone) await onDone(state);
+              controller.close();
+              return;
+            }
+            buf += decoder.decode(value, { stream: true });
+            consume(controller, false);
+          }
+        } catch (e) {
+          if (resolveEmpty) { resolveEmpty(false); resolveEmpty = null; }
+          try { controller.error(e); } catch {}
+        }
+      })();
+    },
+  });
+
+  return { stream, emptiness };
+}
