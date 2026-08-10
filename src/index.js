@@ -832,11 +832,13 @@ async function audit(env, action, targetType, targetId, detail) {
 // 需要设置对应 Secret：OPENAI_OAUTH_CLIENT_ID / _SECRET 等（见 README）
 const OAUTH_PROVIDERS = {
   openai: {
-    authorizeUrl: "https://auth.openai.com/authorize",
+    authorizeUrl: "https://auth.openai.com/oauth/authorize",
     tokenUrl: "https://auth.openai.com/oauth/token",
     scope: "openid profile email offline_access",
     clientIdEnv: "OPENAI_OAUTH_CLIENT_ID",
     clientSecretEnv: "OPENAI_OAUTH_CLIENT_SECRET",
+    // Codex CLI 官方公开客户端（无 secret，环境变量可覆盖）——与原版 sub2api 一致
+    defaultClientId: "app_EMoamEEZ73f0CkXaXp7hrann",
   },
   anthropic: {
     authorizeUrl: "https://console.anthropic.com/v1/oauth/authorize",
@@ -1119,7 +1121,7 @@ async function handleAdmin(request, env, url) {
       const provider = url.searchParams.get("provider") || "";
       const cfg = OAUTH_PROVIDERS[provider];
       if (!cfg) return json({ error: "unknown provider: " + provider }, 400);
-      const clientId = env[cfg.clientIdEnv];
+      const clientId = env[cfg.clientIdEnv] || cfg.defaultClientId;
       if (!clientId) return json({ error: "OAUTH_CLIENT_ID not configured for " + provider }, 400);
       const state = crypto.randomUUID();
       const redirect = new URL(url.origin + "/admin/oauth/callback");
@@ -1140,20 +1142,22 @@ async function handleAdmin(request, env, url) {
       const code = url.searchParams.get("code") || "";
       const cfg = OAUTH_PROVIDERS[provider];
       if (!cfg || !code) return json({ error: "invalid oauth callback" }, 400);
-      const clientId = env[cfg.clientIdEnv];
-      const clientSecret = env[cfg.clientSecretEnv];
-      if (!clientId || !clientSecret) return json({ error: "oauth client not configured" }, 400);
+      const clientId = env[cfg.clientIdEnv] || cfg.defaultClientId;
+      const clientSecret = cfg.clientSecretEnv ? env[cfg.clientSecretEnv] : "";
+      if (!clientId || (cfg.clientSecretEnv && !clientSecret)) return json({ error: "oauth client not configured" }, 400);
       const redirect = new URL(url.origin + "/admin/oauth/callback");
       redirect.searchParams.set("provider", provider);
       redirect.searchParams.set("state", url.searchParams.get("state") || "");
       try {
+        const params = new URLSearchParams({
+          grant_type: "authorization_code",
+          code, client_id: clientId, redirect_uri: redirect.toString(),
+        });
+        if (clientSecret) params.set("client_secret", clientSecret);
         const tok = await fetch(cfg.tokenUrl, {
           method: "POST",
           headers: { "content-type": "application/x-www-form-urlencoded" },
-          body: new URLSearchParams({
-            grant_type: "authorization_code",
-            code, client_id: clientId, client_secret: clientSecret, redirect_uri: redirect.toString(),
-          }).toString(),
+          body: params.toString(),
         });
         if (!tok.ok) return json({ error: "oauth token exchange failed: " + tok.status }, 400);
         const tj = await tok.json();
@@ -1163,6 +1167,8 @@ async function handleAdmin(request, env, url) {
           expires_in: tj.expires_in || null,
           expires_at: tj.expires_in ? now() + Number(tj.expires_in) * 1000 : null,
         };
+        // OpenAI 为公开客户端：记录 client_id 供后续刷新 token 使用
+        if (provider === "openai") cred.client_id = clientId;
         if (!cred.access_token && !cred.refresh_token) return json({ error: "no tokens in oauth response" }, 400);
         // 创建/更新 oauth 账号（同名去重）
         const name = `${provider}-oauth-${String(Math.floor(Math.random() * 1e6))}`;
