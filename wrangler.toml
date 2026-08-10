@@ -3,12 +3,13 @@ main = "src/index.js"
 compatibility_date = "2025-06-01"
 compatibility_flags = ["nodejs_compat"]
 
-# 固定 Worker 运行区域：日本东京（避开 OpenAI 封锁的地区，如香港/大陆）
+# 固定 Worker 运行区域：美国东部（避开 OpenAI 封锁的地区，如香港/大陆）
 # OpenAI 支持美国/日本等地区；原默认按请求就近路由，中国大陆请求会落到香港节点被 OpenAI 403
-# 注意：wrangler 3.x 用 hint 键（region 键会被静默丢弃）；wrangler 4 两种都支持
+# 注意：wrangler 3.x 的 hint 只接受粗粒度区域代码（wnam/enam/sam/weur/eeur/apac/oc/afr/me）
+#   enam = 美国东部（OpenAI 平台支持）
 [placement]
 mode = "smart"
-hint = "gcp:asia-northeast1"
+hint = "enam"
 
 # D1 数据库绑定
 [[d1_databases]]
