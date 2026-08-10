@@ -202,7 +202,20 @@ export const DEFAULT_MODELS = {
   anthropic: ["claude-opus-4-1", "claude-sonnet-4-5", "claude-sonnet-4-6", "claude-haiku-4-5", "claude-3-7-sonnet-latest", "claude-3-5-sonnet-latest", "claude-3-5-haiku-latest"],
   gemini: ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"],
   grok: ["grok-4", "grok-3", "grok-3-mini", "grok-2-latest"],
-  antigravity: ["claude-sonnet-4-6", "claude-opus-4-6-thinking", "claude-haiku-4-5", "gemini-2.5-pro", "gemini-pro-agent", "gemini-2.5-flash"],
+  // 对齐原版 sub2api pkg/antigravity DefaultModels（Claude + Gemini）
+  antigravity: [
+    // Claude
+    "claude-fable-5", "claude-opus-4-5-thinking", "claude-sonnet-4-5",
+    "claude-sonnet-4-5-thinking", "claude-opus-4-6", "claude-opus-4-6-thinking",
+    "claude-opus-4-7", "claude-opus-4-8", "claude-sonnet-4-6",
+    // Gemini
+    "gemini-2.5-flash", "gemini-2.5-flash-image", "gemini-2.5-flash-image-preview",
+    "gemini-2.5-flash-lite", "gemini-2.5-flash-thinking", "gemini-3-flash",
+    "gemini-3-pro-low", "gemini-3-pro-high", "gemini-3.1-pro-low", "gemini-3.1-pro-high",
+    "gemini-3.1-flash-image", "gemini-3.1-flash-image-preview", "gemini-3.6-flash",
+    "gemini-3.6-flash-high", "gemini-3.6-flash-low", "gemini-3.6-flash-medium",
+    "gemini-3.6-flash-tiered", "gemini-3-pro-preview", "gemini-3-pro-image",
+  ],
 };
 
 // 从账号列表收集对外模型名：优先 model_map 的对外 key，缺省回退平台默认列表
@@ -312,15 +325,30 @@ function uid() {
 }
 
 // 模型名解析：账号 model_map（对外名 -> 上游名）优先，其次默认别名表，最后透传
-// 默认别名表对齐 sub2api antigravity_model_mapping（新模型替换旧型号）
+// 默认别名表对齐原版 sub2api domain.DefaultAntigravityModelMapping（新模型替换旧型号）
 const ANTIGRAVITY_MODEL_ALIASES = {
-  "claude-opus-4-6": "claude-opus-4-6-thinking",
-  "claude-opus-4-5": "claude-opus-4-6-thinking",
+  // Claude：旧型号迁移 / 简称映射
   "claude-opus-4-5-thinking": "claude-opus-4-6-thinking",
   "claude-opus-4-5-20251101": "claude-opus-4-6-thinking",
+  "claude-opus-4-6": "claude-opus-4-6-thinking",
+  "claude-sonnet-4-5-20250929": "claude-sonnet-4-5",
+  // Claude Haiku → Sonnet（上游无 Haiku 支持）
   "claude-haiku-4-5": "claude-sonnet-4-6",
   "claude-haiku-4-5-20251001": "claude-sonnet-4-6",
-  "claude-sonnet-4-5-20250929": "claude-sonnet-4-5",
+  // Gemini image preview → image
+  "gemini-2.5-flash-image-preview": "gemini-2.5-flash-image",
+  // Gemini 3 preview
+  "gemini-3-flash-preview": "gemini-3-flash",
+  "gemini-3-pro-preview": "gemini-3-pro-high",
+  // Gemini 3.1 Pro → gemini-pro-agent 上游路由
+  "gemini-3.1-pro": "gemini-pro-agent",
+  "gemini-3.1-pro-high": "gemini-pro-agent",
+  "gemini-3.1-pro-preview": "gemini-pro-agent",
+  // Gemini 3.1 image preview → image
+  "gemini-3.1-flash-image-preview": "gemini-3.1-flash-image",
+  // Gemini 3 image 兼容映射（向 3.1 image 迁移）
+  "gemini-3-pro-image": "gemini-3.1-flash-image",
+  "gemini-3-pro-image-preview": "gemini-3.1-flash-image",
 };
 export function antigravityModelFor(rawCred, model) {
   if (rawCred && rawCred.model_mapping && typeof rawCred.model_mapping === "object" && rawCred.model_mapping[model]) {
