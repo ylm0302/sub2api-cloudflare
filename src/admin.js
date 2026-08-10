@@ -1453,7 +1453,8 @@ function channelSuggest(err, acct){
   if(/fetch failed|timeout|timed out|econn|enetunreach|超时|网络/.test(e)) return "上游不可达：域名被墙或网络受限（本机/沙箱常见）；部署到 Cloudflare 后 Worker 出网正常";
   if(/429|rate limit/.test(e)) return "上游限流(429)：稍等自动恢复";
   if(/5\d\d/.test(e)) return "上游服务异常("+err+")：稍后重试或检查账号状态";
-  if(/refresh|expired|token/.test(e)) return "OAuth token 刷新/过期：重新授权该账号";
+  if(/oauth refresh failed/.test(e)) return "OAuth 刷新失败：为该平台配置 client_id/secret（openai→OPENAI_OAUTH_CLIENT_ID/SECRET，grok→GROK_OAUTH_CLIENT_ID/SECRET，gemini→GEMINI_OAUTH_CLIENT_SECRET，antigravity→ANTIGRAVITY_OAUTH_CLIENT_ID/SECRET）后重试，或重新导入账号";
+  if(/refresh|expired|token/.test(e)) return "OAuth token 刷新/过期：重新授权该账号，或为平台配置 OAuth 密钥后自动刷新";
   return "见错误详情，必要时重新导入该账号";
 }
 function renderChannels(){

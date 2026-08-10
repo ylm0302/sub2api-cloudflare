@@ -640,7 +640,7 @@ async function monitorChannels(env, force = false) {
     : await db.prepare("SELECT * FROM accounts_v2 WHERE status != 'disabled' AND (last_checked_at IS NULL OR last_checked_at < ?)").bind(t - 10 * 60 * 1000).all();
   for (const acct of rows.results || []) {
     try {
-      const res = await probeAccount(acct);
+      const res = await probeAccount(acct, env);
       await db.prepare("UPDATE accounts_v2 SET last_checked_at=?, last_check_result=?, status=?, error_message=? WHERE id=?")
         .bind(t, JSON.stringify(res), res.ok ? "active" : "error", res.ok ? null : (res.error || "health check failed").slice(0, 500), acct.id)
         .run();
@@ -652,19 +652,41 @@ async function monitorChannels(env, force = false) {
 }
 
 // 探测单个账号：返回 { ok, latency_ms, error }。403=鉴权失败但服务可达，视为“可达”。
-async function probeAccount(acct) {
+// 探测单账号：返回 { ok, latency_ms, error }。403=鉴权失败但服务可达，视为“可达”。
+// 会先修两类历史问题：① credentialFor 统一后的 token 在 cred.token（旧代码读 cred.api_key 恒为空导致探测 401）；
+// ② base 已含 /v1 时不再拼双 /v1（openai/grok 默认 base 带 /v1）。
+// ③ oauth 账号 token 过期/临期时先尝试刷新（成功写回 D1 再用新 token 探测）。
+async function probeAccount(acct, env) {
   const cred = credentialFor(acct);
+  let token = cred.token || "";
   const base = (acct.base_url && acct.base_url.trim()) || DEFAULT_BASE[acct.platform];
   const headers = { "content-type": "application/json" };
   let url = "";
+
+  // oauth 过期/临期：先尝试刷新，避免“一键检测”对可恢复账号误报
+  if (needsOAuthRefresh(cred)) {
+    try {
+      const updated = await refreshOAuth(acct.platform, cred, env);
+      const merged = { ...safeJson(acct.credentials, {}), ...updated };
+      await env.DB.prepare("UPDATE accounts_v2 SET credentials=? WHERE id=?")
+        .bind(JSON.stringify(merged), acct.id).run();
+      token = updated.access_token || token;
+      acct.credentials = JSON.stringify(merged);
+    } catch (e) {
+      return { ok: false, latency_ms: null, error: "oauth refresh failed: " + String(e.message || e).slice(0, 180) };
+    }
+  }
+
+  // base 已带 /v1（如 DEFAULT_BASE.openai/grok、自定义 base_url 以 /v1 结尾）则不重复拼接
+  const v1 = /\/v1\/?$/.test(base) ? "" : "/v1";
   if (acct.platform === "anthropic") {
-    url = `${base}/v1/models`;
-    headers["x-api-key"] = cred.api_key || cred.access_token || "";
+    url = `${base}${v1}/models`;
+    headers["x-api-key"] = token;
   } else if (acct.platform === "antigravity") {
     // 真实 Antigravity：fetchAvailableModels 需要 project_id + Google Bearer token
     const rawCred = safeJson(acct.credentials, {});
     url = `${base}/v1internal:fetchAvailableModels`;
-    headers.authorization = "Bearer " + (cred.access_token || cred.api_key || "");
+    headers.authorization = "Bearer " + token;
     const body = JSON.stringify({ project: rawCred.project_id || "" });
     const t0 = now();
     try {
@@ -677,10 +699,10 @@ async function probeAccount(acct) {
       return { ok: false, latency_ms: now() - t0, error: String(e).slice(0, 200) };
     }
   } else if (acct.platform === "gemini") {
-    url = `${base}/v1beta/models?key=${encodeURIComponent(cred.api_key || "")}`;
+    url = `${base}/v1beta/models?key=${encodeURIComponent(token)}`;
   } else {
-    url = `${base}/v1/models`;
-    headers.authorization = "Bearer " + (cred.api_key || "");
+    url = `${base}${v1}/models`;
+    headers.authorization = "Bearer " + token;
   }
   const t0 = now();
   try {

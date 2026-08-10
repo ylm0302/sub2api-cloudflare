@@ -1818,6 +1818,63 @@ async function parityTests(mock) {
     eq(list2[0].error_message, list2[0].probe_error, "error_message 同步为真实原因");
   });
 
+  await test("渠道探测：携带真实凭证 + 不拼双 /v1（回归：探测曾恒发空 token 导致全部 401 / 404）", async () => {
+    const { db, env, ctx } = setup();
+    // openai：默认 base 以 /v1 结尾（api.openai.com/v1），探测 URL 应为 /v1/models 而不是 /v1/v1/models
+    await seedAccount(db, { provider: "openai", name: "pr-oa", api_key: "sk-probe-real", base_url: "" });
+    await seedAccount(db, { provider: "anthropic", name: "pr-an", api_key: "sk-probe-ant", base_url: "" });
+    await seedAccount(db, { provider: "gemini", name: "pr-gm", api_key: "sk-probe-gem", base_url: "" });
+    mock.calls.length = 0;
+    await worker.fetch(new Request("https://x/admin/channels/check", { method: "POST", headers: H }), env, ctx);
+    await ctx.drain();
+    const oa = mock.calls.find((c) => c.host === "api.openai.com");
+    assert(oa, "探测打到 api.openai.com");
+    eq(oa.url, "https://api.openai.com/v1/models", "URL 不带双 /v1");
+    eq(oa.headers.authorization, "Bearer sk-probe-real", "openai 探测带真实 Bearer token");
+    const an = mock.calls.find((c) => c.host === "api.anthropic.com");
+    eq(an.url, "https://api.anthropic.com/v1/models", "anthropic /v1/models");
+    eq(an.headers["x-api-key"], "sk-probe-ant", "anthropic 探测带真实 x-api-key");
+    const gm = mock.calls.find((c) => c.host === "generativelanguage.googleapis.com");
+    assert(gm.url.includes("/v1beta/models?key=sk-probe-gem"), "gemini 探测带真实 key 参数");
+    // 自定义 base_url 以 /v1 结尾（如 grok 的 cli-chat-proxy.grok.com/v1）也不应拼双 /v1
+    await seedAccountV2(db, { name: "pr-grok", platform: "grok", credentials: { api_key: "sk-grok-x" }, base_url: "https://cli-chat-proxy.grok.com/v1" });
+    mock.calls.length = 0;
+    await worker.fetch(new Request("https://x/admin/channels/check", { method: "POST", headers: H }), env, ctx);
+    await ctx.drain();
+    const gk = mock.calls.find((c) => c.host === "cli-chat-proxy.grok.com");
+    assert(gk, "grok 探测打到自定义 base");
+    eq(gk.url, "https://cli-chat-proxy.grok.com/v1/models", "自定义 base 带 /v1 不重复拼接");
+    eq(gk.headers.authorization, "Bearer sk-grok-x", "grok 探测带真实 token");
+  });
+
+  await test("渠道探测：过期 oauth 先自动刷新再探测（新 token 写回 D1）", async () => {
+    const orig = globalThis.fetch;
+    globalThis.fetch = async (url, opts = {}) => {
+      const u = new URL(typeof url === "string" ? url : url.toString());
+      if (u.host === "auth.openai.com" && u.pathname.includes("/oauth/token")) {
+        return new Response(JSON.stringify({ access_token: "new-at", refresh_token: "new-rt", expires_in: 3600 }), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }
+      return orig(url, opts);
+    };
+    const { db, env, ctx } = setup();
+    await seedAccountV2(db, {
+      name: "pr-oauth", platform: "openai", type: "oauth",
+      credentials: { access_token: "old-at", refresh_token: "old-rt", expires_at: Date.now() - 1000 },
+    });
+    mock.calls.length = 0;
+    await worker.fetch(new Request("https://x/admin/channels/check", { method: "POST", headers: H }), env, ctx);
+    await ctx.drain();
+    const oa = mock.calls.find((c) => c.host === "api.openai.com");
+    assert(oa, "刷新后仍探测 openai");
+    eq(oa.headers.authorization, "Bearer new-at", "探测使用刷新后的新 token");
+    const row = await db.prepare("SELECT credentials FROM accounts_v2 WHERE name='pr-oauth'").first();
+    const c = JSON.parse(row.credentials);
+    eq(c.access_token, "new-at", "新 token 已写回 D1");
+    globalThis.fetch = orig;
+  });
+
   await test("模型广场汇总 model_map", async () => {
     const { db, env, ctx } = setup();
     await seedAccount(db, { provider: "openai", name: "m-acc", api_key: "sk-m", model_map: { "gpt-4o": "gpt-4o" } });
