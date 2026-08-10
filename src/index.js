@@ -17,6 +17,29 @@ export default {
     if (path === "/health") {
       return json({ ok: true, service: "sub2api-cf", v: 2, ts: Date.now() });
     }
+    // 免令牌诊断：查看 ADMIN_TOKEN 是否配置、D1 是否绑定且建表成功
+    if (path === "/admin/diag" && request.method === "GET") {
+      const out = {
+        service: "sub2api-cf",
+        admin_token_configured: !!env.ADMIN_TOKEN,
+        d1_bound: !!env.DB,
+        ts: Date.now(),
+      };
+      if (env.DB) {
+        try {
+          const t = await env.DB.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='accounts_v2'").first();
+          const u = await env.DB.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='users'").first();
+          out.d1_ok = !!(t && u);
+          out.d1_tables = { accounts_v2: !!t, users: !!u };
+          const c = await env.DB.prepare("SELECT COUNT(*) AS n FROM accounts_v2").first();
+          out.accounts = c.n;
+        } catch (e) {
+          out.d1_ok = false;
+          out.d1_error = String((e && e.message) || e).slice(0, 200);
+        }
+      }
+      return json(out);
+    }
     if (path === "/") {
       const u = new URL(request.url);
       u.pathname = "/admin";

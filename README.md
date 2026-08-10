@@ -63,6 +63,32 @@ npx wrangler deploy
 
 > 可选：Gemini OAuth 刷新需要 client_secret，用 `wrangler secret put GEMINI_OAUTH_CLIENT_SECRET` 设置。
 
+### 管理令牌设置（二选一）
+
+方式一（推荐，密钥不进仓库）：
+```bash
+npx wrangler secret put ADMIN_TOKEN
+```
+
+方式二（个人使用偷懒方案：直接写进 wrangler.toml 的 `[vars]`，改完 `wrangler deploy` 生效）：
+```toml
+[vars]
+ADMIN_TOKEN = "sk-换成你的强随机串"
+```
+
+### 打不开后台？先看诊断页
+
+部署后若 `/admin` 报 `unauthorized`，先打开**免令牌诊断页** `https://<你的地址>/admin/diag`，它会直接告诉你：
+
+```json
+{ "admin_token_configured": true,   // false = ADMIN_TOKEN 没设置（按上面方式一/二设置）
+  "d1_bound": true,                  // false = D1 绑定缺失（检查 wrangler.toml 的 database_id）
+  "d1_ok": true,                     // false = 表没建（执行 wrangler d1 migrations apply sub2api-cf --remote）
+  "d1_tables": { "accounts_v2": true, "users": true } }
+```
+
+然后带令牌访问：`/admin?token=<你的ADMIN_TOKEN>`。如果之前输错过令牌，浏览器会记住，用 `localStorage.removeItem("sub2api_cf_token")` 清掉再刷新。
+
 ---
 
 ## 导入账号（核心能力）

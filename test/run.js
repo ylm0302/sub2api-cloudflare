@@ -844,6 +844,33 @@ async function integrationTests(mock) {
     eq(grokCalls[0].headers.authorization, "Bearer sk-grok", "带 Bearer key");
   });
 
+  await test("诊断端点 /admin/diag + 令牌未配置提示", async () => {
+    const { db, env, ctx } = setup();
+    // 正常环境：令牌已配置、D1 已建表
+    const d = await worker.fetch(new Request("https://x/admin/diag"), env, ctx).then((r) => r.json());
+    eq(d.admin_token_configured, true, "令牌已配置");
+    eq(d.d1_ok, true, "D1 建表正常");
+    eq(d.d1_tables.accounts_v2, true, "accounts_v2 表存在");
+    // 令牌没配：diag 明确指出 + admin API 返回明确提示
+    const envNoTok = { DB: db }; // 无 ADMIN_TOKEN
+    const d2 = await worker.fetch(new Request("https://x/admin/diag"), envNoTok, ctx).then((r) => r.json());
+    eq(d2.admin_token_configured, false, "diag 显示未配置");
+    const r = await worker.fetch(new Request("https://x/admin/stats", { headers: { "x-admin-token": "anything" } }), envNoTok, ctx);
+    eq(r.status, 401, "未配置时 401");
+    const j = await r.json();
+    assert(/ADMIN_TOKEN 未配置/.test(j.error), "提示未配置");
+    // 有配置但令牌错 / 缺失：对应提示
+    const r2 = await worker.fetch(new Request("https://x/admin/stats", { headers: { "x-admin-token": "wrong" } }), env, ctx);
+    const j2 = await r2.json();
+    assert(/令牌不正确/.test(j2.error), "提示令牌不正确");
+    const r3 = await worker.fetch(new Request("https://x/admin/stats"), env, ctx);
+    const j3 = await r3.json();
+    assert(/缺少管理令牌/.test(j3.error), "提示缺少令牌");
+    // 正确令牌正常
+    const ok = await worker.fetch(new Request("https://x/admin/stats", { headers: { "x-admin-token": "test-admin-token" } }), env, ctx);
+    eq(ok.status, 200, "正确令牌 200");
+  });
+
   await test("真实 Sub2API 备份导出格式 {accounts:[...],expires_at秒} 可导入", async () => {
     const { db, env, ctx } = setup();
     const H = { "x-admin-token": "test-admin-token", "content-type": "application/json" };
