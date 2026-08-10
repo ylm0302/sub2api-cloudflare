@@ -5,9 +5,10 @@ compatibility_flags = ["nodejs_compat"]
 
 # 固定 Worker 运行区域：日本东京（避开 OpenAI 封锁的地区，如香港/大陆）
 # OpenAI 支持美国/日本等地区；原默认按请求就近路由，中国大陆请求会落到香港节点被 OpenAI 403
+# 注意：wrangler 3.x 用 hint 键（region 键会被静默丢弃）；wrangler 4 两种都支持
 [placement]
 mode = "smart"
-region = "gcp:asia-northeast1"
+hint = "gcp:asia-northeast1"
 
 # D1 数据库绑定
 [[d1_databases]]
