@@ -846,8 +846,20 @@ function openAIChunkToAnthropic(j, state) {
 
 function flushAnthropic(state) {
   const out = [];
+  // 上游完全无数据（空 200 / 无候选内容）时，仍要输出合法的 Anthropic SSE 结构：
+  // 缺少 message_start 的流会让 Claude Code 报 "Stream ended without receiving any events"
+  if (!state.started) {
+    state.started = true;
+    out.push({
+      type: "message_start",
+      message: { id: "msg_" + Date.now(), type: "message", role: "assistant", model: state.model, content: [], usage: { input_tokens: 0, output_tokens: 0 } },
+    });
+    out.push({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
+    out.push({ type: "content_block_stop", index: 0 });
+  } else if (!state.finished) {
+    out.push({ type: "content_block_stop", index: 0 });
+  }
   if (!state.finished) {
-    if (state.started) out.push({ type: "content_block_stop", index: 0 });
     out.push({
       type: "message_delta",
       delta: { stop_reason: "end_turn", stop_sequence: null },
