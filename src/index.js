@@ -45,6 +45,7 @@ export default {
       for (const [name, u] of Object.entries({
         "api.openai.com": "https://api.openai.com/v1/models",
         "chatgpt.com": "https://chatgpt.com/backend-api/codex/responses",
+        "egress-ip": "https://ipinfo.io/json",
       })) {
         try {
           const r = await fetch(u, { method: "GET", signal: AbortSignal.timeout(8000) });
