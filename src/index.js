@@ -48,7 +48,12 @@ export default {
       })) {
         try {
           const r = await fetch(u, { method: "GET", signal: AbortSignal.timeout(8000) });
-          out.upstream[name] = { status: r.status, ok: r.ok };
+          const txt = await r.text().catch(() => "");
+          out.upstream[name] = {
+            status: r.status,
+            ok: r.ok,
+            body: txt.replace(/\s+/g, " ").trim().slice(0, 200),
+          };
         } catch (e) {
           out.upstream[name] = { error: String((e && e.message) || e).slice(0, 120) };
         }
